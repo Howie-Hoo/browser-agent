@@ -1,5 +1,5 @@
 ---
-name: browser_agent
+name: browser-agent
 description: Python Playwright 浏览器操作代理：AI 驱动、语义感知、持久微服务架构。涉及浏览器自动化、UI E2E、Playwright 驱动页面、认证会话 profile 时必须读。
 ---
 
@@ -22,7 +22,7 @@ description: Python Playwright 浏览器操作代理：AI 驱动、语义感知�
 ## 依赖安装
 
 ```bash
-pip install .            # 或 pip install git+https://github.com/Howie-Hoo/browser-agent
+pip install git+https://github.com/Howie-Hoo/browser-agent
 playwright install chromium
 ```
 

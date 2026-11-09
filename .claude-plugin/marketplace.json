@@ -1,0 +1,8 @@
+{
+  "name": "browser-agent",
+  "description": "browser-agent 插件市场：给 AI 代理装上真实浏览器的手和眼（本地 Playwright 微服务）",
+  "owner": { "name": "Howie-Hoo" },
+  "plugins": [
+    { "name": "browser-agent", "source": "./" }
+  ]
+}

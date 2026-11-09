@@ -6,7 +6,8 @@
 
 ## 为什么用它
 
-- **模型没有视觉 / 没有 computer-use 也能操作网页。** computer-use（截屏→坐标动作的闭环）是少数模型才有的特化能力，绝大多数模型与 agent 环境（包括终端里的编码代理）没有这条通路。本服务把感知翻译成结构化文本（无障碍语义树、页面摘要、表单结构分析），不需要截图视觉理解、不需要官方 computer-use API——任何能发 HTTP 请求或跑 shell 命令的模型，都获得对真实浏览器的完整操作能力。边界：纯视觉判断（布局错位、样式重叠）仍需截图配视觉模型，`screenshot` 命令永远可用作兜底。
+- **模型没有视觉 / 没有 computer-use 也能操作网页。** 感知层把页面翻译成结构化文本（无障碍语义树、页面摘要、表单结构分析），不需要截图视觉理解、不需要官方 computer-use 能力——任何能发 HTTP 请求或跑 shell 命令的模型，都获得对真实浏览器的完整操作能力。
+- **有 computer-use 也未必该用。** 截图 + 坐标点击的循环每步把整页截图塞进上下文，慢且贵；文本化感知信息密度高得多，页面改版也不影响语义定位——表单、导航、校验类任务用结构化操作更稳更省。
 - **终端里的编码代理原生没有浏览器。** Claude Code / Cursor 这类 agent 改完前端代码后，只能靠测试断言间接确认。本服务让它们直接打开真实页面验证：SPA 渲染、cookie、登录态、JS 报错，看的是真相而不是猜。
 - **selector 太脆。** 语义点击 `find_and_act`（用自然语言描述目标，无需 selector）+ 点击超时自动文字模糊匹配自愈，页面改版不至于全线失效。
 - **每次测试冷启动浏览器太慢。** 服务常驻：单 Chromium 实例全程复用，多任务各占隔离 context，批命令排队执行，空闲自动回收内存。
@@ -39,29 +40,12 @@ browser-agent 服务（aiohttp 常驻：资源预检 / 批级排队 / 空闲回�
 底层精准（兜底）：click / fill / eval_js / screenshot（始终可用）
 ```
 
-## 安装
-
-**方式 A：作为 Claude Code skill 安装（推荐）**——克隆进 skills 目录即被自动发现，代理跨会话可用：
-
-```bash
-# 个人级（所有项目可用）；项目级改用 <项目>/.claude/skills/
-git clone https://github.com/Howie-Hoo/browser-agent ~/.claude/skills/browser-agent
-pip install -e ~/.claude/skills/browser-agent
-playwright install chromium
-```
-
-**方式 B：只当 Python 包用**（不需要 skill 发现）：
-
-```bash
-pip install git+https://github.com/Howie-Hoo/browser-agent
-playwright install chromium
-```
-
-直接对 AI 代理说「帮我安装这个 skill：https://github.com/Howie-Hoo/browser-agent 」即可——代理会照本节执行（需要 shell 里可用 git / pip / Python ≥3.10）。
-
 ## 快速开始
 
 ```bash
+pip install .          # 或 pip install git+https://github.com/Howie-Hoo/browser-agent
+playwright install chromium
+
 # 启动服务（客户端自动管理，推荐）
 browser-agent-client start --url=http://localhost:3000 --port=7788
 ```
@@ -101,9 +85,23 @@ with BrowserAgentClient(base_url="http://localhost:3000") as client:
 
 profile 接入两步法与格式定义见 [SKILL.md](SKILL.md)「认证会话管理」。
 
-## Claude Code 接入
+## 安装与接入（Claude Code）
 
-按「安装·方式 A」装入 skills 目录后，根目录的 [SKILL.md](SKILL.md) 会被自动发现加载——降级层级、AI 标准流程、会话模型、资源预检约束都在里面，无需改项目任何文件。服务状态随时可用 `browser-agent-client status` 查看。
+**一键装技能（推荐）**：
+
+```text
+/plugin install browser-agent --marketplace Howie-Hoo/browser-agent
+```
+
+再装运行时（无需克隆仓库）：
+
+```bash
+pip install git+https://github.com/Howie-Hoo/browser-agent && playwright install chromium
+```
+
+直接对 AI 说「帮我安装这个 skill：https://github.com/Howie-Hoo/browser-agent」也可以——它会按上面两步执行。
+
+**手动接入（其他 agent / 不走插件）**：克隆仓库后 `pip install -e <仓库路径>`，把仓库根 [SKILL.md](SKILL.md)（AI 操作手册：降级层级、标准流程、会话模型、约束）指给项目 `CLAUDE.md` 即可。
 
 ## 配置
 
