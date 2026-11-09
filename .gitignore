@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.pytest_cache/
+
+# 运行时产物（报告/截图/登录态，含凭证不入库）
+temp/
+browser_agent/storage/
+browser_agent/browser_agent.pid
+browser_agent.pid
+
+# 本地配置（从 config.example.yaml 复制后改）
+browser_agent.yaml

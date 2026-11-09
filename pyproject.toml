@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "browser-agent"
+description = "面向 AI 编程代理的本地浏览器微服务：Playwright 持久实例 + 多会话隔离 + 语义感知命令 + 认证 profile 复用"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "playwright>=1.40",
+    "aiohttp>=3.9",
+    "httpx>=0.27",
+    "PyYAML>=6.0",
+    "playwright-stealth>=1.0",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+browser-agent-server = "browser_agent.server:main"
+browser-agent-client = "browser_agent.client:main"
+browser-agent-cleanup = "browser_agent.cleanup:main"
+
+[tool.setuptools]
+packages = ["browser_agent"]
+
+[tool.setuptools.package-data]
+browser_agent = ["cleanup.sh"]
+
+[tool.setuptools.dynamic]
+version = { attr = "browser_agent.__version__" }

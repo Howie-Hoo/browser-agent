@@ -1,0 +1,46 @@
+# browser_agent 配置文件
+# 修改此文件后需重启服务生效
+
+browser:
+  # 浏览器启动模式：false=有头模式（可见窗口），true=无头模式（后台运行）
+  headless: false
+  # 浏览器类型：chromium / firefox / webkit
+  browser_type: chromium
+  # 默认打开的目标地址（启动时可通过 --url 参数覆盖）
+  base_url: "http://localhost:3000"
+  # 视口尺寸
+  viewport:
+    width: 1440
+    height: 900
+  # 默认超时（毫秒）
+  timeout: 30000
+  # 慢动作延迟（毫秒，0=无延迟，调试时可设为 100-500）
+  slow_mo: 0
+  # 是否忽略 HTTPS 错误
+  ignore_https_errors: true
+
+server:
+  # HTTP 服务端口
+  port: 7788
+  # 主机地址
+  host: "127.0.0.1"
+
+proxy:
+  # 代理服务器（留空则不使用代理）
+  server: ""
+  # 代理用户名
+  username: ""
+  # 代理密码
+  password: ""
+
+stealth:
+  # 是否启用反检测模式
+  enabled: true
+
+storage:
+  # 状态存储路径
+  state_path: "storage/state.json"
+  # 是否在启动时自动加载上次的状态（cookies、localStorage）
+  auto_load_state: false
+  # 是否在关闭时自动保存状态
+  auto_save_state: true
