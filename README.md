@@ -6,7 +6,7 @@
 
 ## 为什么用它
 
-- **模型没有视觉 / 没有 computer-use 也能操作网页。** 感知层把页面翻译成结构化文本（无障碍语义树、页面摘要、表单结构分析），不需要截图视觉理解、不需要官方 computer-use API——任何能发 HTTP 请求或跑 shell 命令的模型，都获得对真实浏览器的完整操作能力。
+- **模型没有视觉 / 没有 computer-use 也能操作网页。** computer-use（截屏→坐标动作的闭环）是少数模型才有的特化能力，绝大多数模型与 agent 环境（包括终端里的编码代理）没有这条通路。本服务把感知翻译成结构化文本（无障碍语义树、页面摘要、表单结构分析），不需要截图视觉理解、不需要官方 computer-use API——任何能发 HTTP 请求或跑 shell 命令的模型，都获得对真实浏览器的完整操作能力。边界：纯视觉判断（布局错位、样式重叠）仍需截图配视觉模型，`screenshot` 命令永远可用作兜底。
 - **终端里的编码代理原生没有浏览器。** Claude Code / Cursor 这类 agent 改完前端代码后，只能靠测试断言间接确认。本服务让它们直接打开真实页面验证：SPA 渲染、cookie、登录态、JS 报错，看的是真相而不是猜。
 - **selector 太脆。** 语义点击 `find_and_act`（用自然语言描述目标，无需 selector）+ 点击超时自动文字模糊匹配自愈，页面改版不至于全线失效。
 - **每次测试冷启动浏览器太慢。** 服务常驻：单 Chromium 实例全程复用，多任务各占隔离 context，批命令排队执行，空闲自动回收内存。
@@ -39,12 +39,29 @@ browser-agent 服务（aiohttp 常驻：资源预检 / 批级排队 / 空闲回�
 底层精准（兜底）：click / fill / eval_js / screenshot（始终可用）
 ```
 
+## 安装
+
+**方式 A：作为 Claude Code skill 安装（推荐）**——克隆进 skills 目录即被自动发现，代理跨会话可用：
+
+```bash
+# 个人级（所有项目可用）；项目级改用 <项目>/.claude/skills/
+git clone https://github.com/Howie-Hoo/browser-agent ~/.claude/skills/browser-agent
+pip install -e ~/.claude/skills/browser-agent
+playwright install chromium
+```
+
+**方式 B：只当 Python 包用**（不需要 skill 发现）：
+
+```bash
+pip install git+https://github.com/Howie-Hoo/browser-agent
+playwright install chromium
+```
+
+直接对 AI 代理说「帮我安装这个 skill：https://github.com/Howie-Hoo/browser-agent 」即可——代理会照本节执行（需要 shell 里可用 git / pip / Python ≥3.10）。
+
 ## 快速开始
 
 ```bash
-pip install .          # 或 pip install git+https://github.com/Howie-Hoo/browser-agent
-playwright install chromium
-
 # 启动服务（客户端自动管理，推荐）
 browser-agent-client start --url=http://localhost:3000 --port=7788
 ```
@@ -84,9 +101,9 @@ with BrowserAgentClient(base_url="http://localhost:3000") as client:
 
 profile 接入两步法与格式定义见 [SKILL.md](SKILL.md)「认证会话管理」。
 
-## AI 代理接入
+## Claude Code 接入
 
-本仓库根的 [SKILL.md](SKILL.md) 是给 AI 代理读的操作手册（降级层级、标准流程、会话模型、约束）。在 Claude Code 里接入：把仓库克隆到项目旁，`pip install -e <仓库路径>`，再在项目 `CLAUDE.md` 里指向本仓库 SKILL.md 即可。
+按「安装·方式 A」装入 skills 目录后，根目录的 [SKILL.md](SKILL.md) 会被自动发现加载——降级层级、AI 标准流程、会话模型、资源预检约束都在里面，无需改项目任何文件。服务状态随时可用 `browser-agent-client status` 查看。
 
 ## 配置
 

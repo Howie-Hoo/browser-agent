@@ -6,7 +6,7 @@
 
 ## Why
 
-- **Works without vision or computer-use.** The perception layer turns pages into structured text (accessibility tree, page summaries, form analysis) — no screenshot vision, no proprietary computer-use API. Any model that can make an HTTP request or run a shell command gets full control of a real browser.
+- **Works without vision or computer-use.** Computer-use (the screenshot → coordinate-action loop) is a specialized capability only a few models have; the vast majority of models and agent environments — including terminal coding agents — have no such pathway. This service turns perception into structured text (accessibility tree, page summaries, form analysis) — no screenshot vision, no proprietary computer-use API. Any model that can make an HTTP request or run a shell command gets full control of a real browser. Boundary: purely visual judgments (layout breaks, overlapping styles) still need screenshots plus a vision model — the `screenshot` command is always available as the fallback.
 - **Terminal coding agents have no browser.** After changing frontend code, agents like Claude Code can only verify indirectly through test assertions. This service lets them open the real page and check SPA rendering, cookies, auth state, and JS errors — truth, not guesses.
 - **Selectors are brittle.** Semantic `find_and_act` (describe the target in natural language, no selector) plus automatic fuzzy-text self-healing on click timeouts survives UI refactors.
 - **Cold-starting a browser per test is slow.** The service stays resident: one Chromium instance shared end-to-end, each task in an isolated context, command batches queued, idle browser reclaimed automatically.
@@ -39,12 +39,29 @@ Structural (backup): get_interactive_elements / get_page_summary / extract
 Precise primitives (last resort): click / fill / eval_js / screenshot (always available)
 ```
 
+## Installation
+
+**Option A: install as a Claude Code skill (recommended)** — clone into the skills directory for auto-discovery; the agent can use it across sessions:
+
+```bash
+# personal (all projects); for a single project use <project>/.claude/skills/
+git clone https://github.com/Howie-Hoo/browser-agent ~/.claude/skills/browser-agent
+pip install -e ~/.claude/skills/browser-agent
+playwright install chromium
+```
+
+**Option B: use it as a plain Python package** (no skill discovery needed):
+
+```bash
+pip install git+https://github.com/Howie-Hoo/browser-agent
+playwright install chromium
+```
+
+Just tell your AI agent "install this skill: https://github.com/Howie-Hoo/browser-agent" — it will follow this section (requires git / pip / Python ≥3.10 in the shell).
+
 ## Quick start
 
 ```bash
-pip install .          # or: pip install git+https://github.com/Howie-Hoo/browser-agent
-playwright install chromium
-
 # start the service (client-managed, recommended)
 browser-agent-client start --url=http://localhost:3000 --port=7788
 ```
@@ -84,9 +101,9 @@ Full command reference (40+ commands / 15 HTTP endpoints): [docs/command-referen
 
 Profile format and the two-step integration are documented in [SKILL.md](SKILL.md) (in Chinese).
 
-## Integrating with an AI agent
+## Claude Code integration
 
-[SKILL.md](SKILL.md) at the repo root is the operator manual for AI agents (degradation tiers, standard flows, session model, constraints). For Claude Code: clone this repo next to your project, `pip install -e <repo path>`, and point your project's `CLAUDE.md` at this SKILL.md.
+After installing via Option A, the root [SKILL.md](SKILL.md) is discovered and loaded automatically — degradation tiers, standard agent flows, session model, and resource-preflight constraints all live there; no project files need changing. Check service state anytime with `browser-agent-client status`.
 
 ## Configuration
 
