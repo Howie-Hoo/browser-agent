@@ -43,7 +43,7 @@ browser-agent 服务（aiohttp 常驻：资源预检 / 批级排队 / 空闲回�
 ## 快速开始
 
 ```bash
-pip install .          # 或 pip install git+https://github.com/Howie-Hoo/browser-agent
+pip install git+https://github.com/Howie-Hoo/browser-agent   # 或克隆仓库后 pip install .
 playwright install chromium
 
 # 启动服务（客户端自动管理，推荐）
@@ -70,7 +70,7 @@ with BrowserAgentClient(base_url="http://localhost:3000") as client:
 
 **CLI：** `status | start | run <json> | check <type> | reset | shutdown`
 
-命令全表（40+ 命令 / 15 个 HTTP 端点）见 [docs/command-reference.md](docs/command-reference.md)。
+命令全表（40+ 命令 / 15 个 HTTP 端点）见 [docs/command-reference.md](docs/command-reference.md)；更多安装方式（插件通道 / 一句话让 AI 代装）见[安装与接入](#安装与接入)。
 
 ## 核心能力
 
@@ -87,23 +87,33 @@ profile 接入两步法与格式定义见 [SKILL.md](SKILL.md)「认证会话管
 
 ## 安装与接入
 
-适用于**任何**能执行命令或发 HTTP 请求的 AI 代理——Claude Code、Cursor、Codex、自研 agent 均可；Claude Code 用户另有官方插件通道一键接入。
+适用于**任何**能执行命令或发 HTTP 请求的 AI 代理——Claude Code、Cursor、Codex、自研 agent 均可。三种方式任选其一：
 
-**Claude Code（推荐，一键装技能）**：
+### 方式一：一句话让 AI 自己装（推荐）
+
+把下面这行原样复制给你的 agent，它会按本仓库文档自动完成依赖安装与 SKILL.md 接入：
+
+```text
+帮我安装这个 skill：https://github.com/Howie-Hoo/browser-agent
+```
+
+### 方式二：Claude Code 插件一键安装
+
+偏好确定性命令的 Claude Code 用户，可用官方插件通道一行装上：
 
 ```text
 /plugin install browser-agent --marketplace Howie-Hoo/browser-agent
 ```
 
-**运行时安装（所有 agent 通用，无需克隆仓库）**：
+### 方式三：手动安装（所有 agent 通用，无需克隆仓库）
 
 ```bash
 pip install git+https://github.com/Howie-Hoo/browser-agent && playwright install chromium
 ```
 
-装好后把仓库根 [SKILL.md](SKILL.md)（AI 操作手册：降级层级、标准流程、会话模型、约束）指给 agent 的项目规则文件（CLAUDE.md / AGENTS.md / 系统提示词均可）。
+手动安装后，把仓库根的 [SKILL.md](SKILL.md)——AI 操作手册（降级层级、标准流程、会话模型、约束）——接入 agent 的项目规则文件（CLAUDE.md / AGENTS.md / 系统提示词均可）。
 
-直接对 AI 说「帮我安装这个 skill：https://github.com/Howie-Hoo/browser-agent」也可以——它会按上面步骤执行。
+任一方式完成后，用 `browser-agent-client status` 确认服务在位。
 
 ## 配置
 

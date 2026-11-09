@@ -43,7 +43,7 @@ Precise primitives (last resort): click / fill / eval_js / screenshot (always av
 ## Quick start
 
 ```bash
-pip install .          # or: pip install git+https://github.com/Howie-Hoo/browser-agent
+pip install git+https://github.com/Howie-Hoo/browser-agent   # or clone the repo, then: pip install .
 playwright install chromium
 
 # start the service (client-managed, recommended)
@@ -70,7 +70,7 @@ with BrowserAgentClient(base_url="http://localhost:3000") as client:
 
 **CLI:** `status | start | run <json> | check <type> | reset | shutdown`
 
-Full command reference (40+ commands / 15 HTTP endpoints): [docs/command-reference.md](docs/command-reference.md).
+Full command reference (40+ commands / 15 HTTP endpoints): [docs/command-reference.md](docs/command-reference.md). More install options (plugin channel, one line to your AI) under [Install](#install).
 
 ## Core capabilities
 
@@ -87,23 +87,33 @@ Profile format and the two-step integration are documented in [SKILL.md](SKILL.m
 
 ## Install
 
-Works with **any** AI agent that can run commands or make HTTP requests — Claude Code, Cursor, Codex, custom agents alike. Claude Code users additionally get a one-line official plugin install.
+Works with **any** AI agent that can run commands or make HTTP requests — Claude Code, Cursor, Codex, custom agents alike. Pick whichever suits you:
 
-**Claude Code (recommended)**:
+### Option 1: one line to your AI (recommended)
+
+Copy this verbatim to your agent — it follows this repo's docs to install the runtime and wire up SKILL.md:
+
+```text
+Install this skill: https://github.com/Howie-Hoo/browser-agent
+```
+
+### Option 2: Claude Code plugin
+
+Claude Code users who prefer an exact command can use the official plugin channel:
 
 ```text
 /plugin install browser-agent --marketplace Howie-Hoo/browser-agent
 ```
 
-**Runtime install (all agents, no clone needed)**:
+### Option 3: manual install (all agents, no clone needed)
 
 ```bash
 pip install git+https://github.com/Howie-Hoo/browser-agent && playwright install chromium
 ```
 
-Then point your agent's project rules file (CLAUDE.md / AGENTS.md / system prompt) at the repo-root [SKILL.md](SKILL.md) — the operator manual for AI agents (degradation tiers, standard flows, session model, constraints).
+After a manual install, point your agent's project rules file (CLAUDE.md / AGENTS.md / system prompt) at the repo-root [SKILL.md](SKILL.md) — the operator manual for AI agents (degradation tiers, standard flows, session model, constraints).
 
-Telling your AI "install this skill: https://github.com/Howie-Hoo/browser-agent" works too — it follows the steps above.
+However you installed, `browser-agent-client status` confirms the service is in place.
 
 ## Configuration
 
