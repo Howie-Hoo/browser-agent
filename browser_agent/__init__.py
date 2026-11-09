@@ -1,5 +1,5 @@
 """browser-agent：给 AI 代理用的本地浏览器操作微服务（Playwright）。"""
-__version__ = "2026.11.9"
+__version__ = "2026.11.9.1"
 
 # 惰性导出：client/server 顶层缺依赖时会 sys.exit(1)，急切导入会让
 # `import browser_agent` 在未装依赖的环境里直接崩溃

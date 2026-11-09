@@ -1,6 +1,6 @@
 {
   "name": "browser-agent",
   "description": "给 AI 代理装上真实浏览器的手和眼：感知优先、selector 兜底的本地 Playwright 微服务",
-  "version": "2026.11.9",
+  "version": "2026.11.9.1",
   "author": { "name": "Howie-Hoo" }
 }
