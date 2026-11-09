@@ -85,23 +85,25 @@ with BrowserAgentClient(base_url="http://localhost:3000") as client:
 
 profile 接入两步法与格式定义见 [SKILL.md](SKILL.md)「认证会话管理」。
 
-## 安装与接入（Claude Code）
+## 安装与接入
 
-**一键装技能（推荐）**：
+适用于**任何**能执行命令或发 HTTP 请求的 AI 代理——Claude Code、Cursor、Codex、自研 agent 均可；Claude Code 用户另有官方插件通道一键接入。
+
+**Claude Code（推荐，一键装技能）**：
 
 ```text
 /plugin install browser-agent --marketplace Howie-Hoo/browser-agent
 ```
 
-再装运行时（无需克隆仓库）：
+**运行时安装（所有 agent 通用，无需克隆仓库）**：
 
 ```bash
 pip install git+https://github.com/Howie-Hoo/browser-agent && playwright install chromium
 ```
 
-直接对 AI 说「帮我安装这个 skill：https://github.com/Howie-Hoo/browser-agent」也可以——它会按上面两步执行。
+装好后把仓库根 [SKILL.md](SKILL.md)（AI 操作手册：降级层级、标准流程、会话模型、约束）指给 agent 的项目规则文件（CLAUDE.md / AGENTS.md / 系统提示词均可）。
 
-**手动接入（其他 agent / 不走插件）**：克隆仓库后 `pip install -e <仓库路径>`，把仓库根 [SKILL.md](SKILL.md)（AI 操作手册：降级层级、标准流程、会话模型、约束）指给项目 `CLAUDE.md` 即可。
+直接对 AI 说「帮我安装这个 skill：https://github.com/Howie-Hoo/browser-agent」也可以——它会按上面步骤执行。
 
 ## 配置
 

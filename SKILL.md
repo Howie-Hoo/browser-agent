@@ -229,4 +229,4 @@ def _cleanup_after_session():
 "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "browser-agent-cleanup", "timeout": 10 }] }] }
 ```
 
-> **接入新项目**：克隆本仓库并 `pip install -e <仓库路径>`，按 ②③ 接入 conftest + Stop hook 即获得自动兜底（Stop hook 用 `browser-agent-cleanup` 入口则与克隆位置无关）。若用裸 Playwright API（不经本服务），在 fixture teardown 显式 `browser.close(); playwright.stop()`。
+> **接入新项目（任意 AI agent 通用）**：克隆本仓库并 `pip install -e <仓库路径>`（或 `pip install git+<仓库地址>`），按 ②③ 接入 conftest + Stop hook 即获得自动兜底（Stop hook 用 `browser-agent-cleanup` 入口则与克隆位置无关）。若用裸 Playwright API（不经本服务），在 fixture teardown 显式 `browser.close(); playwright.stop()`。

@@ -85,23 +85,25 @@ Full command reference (40+ commands / 15 HTTP endpoints): [docs/command-referen
 
 Profile format and the two-step integration are documented in [SKILL.md](SKILL.md) (in Chinese).
 
-## Install (Claude Code)
+## Install
 
-**One-liner (recommended)**:
+Works with **any** AI agent that can run commands or make HTTP requests — Claude Code, Cursor, Codex, custom agents alike. Claude Code users additionally get a one-line official plugin install.
+
+**Claude Code (recommended)**:
 
 ```text
 /plugin install browser-agent --marketplace Howie-Hoo/browser-agent
 ```
 
-Then install the runtime (no clone needed):
+**Runtime install (all agents, no clone needed)**:
 
 ```bash
 pip install git+https://github.com/Howie-Hoo/browser-agent && playwright install chromium
 ```
 
-Telling your AI "install this skill: https://github.com/Howie-Hoo/browser-agent" works too — it follows the two steps above.
+Then point your agent's project rules file (CLAUDE.md / AGENTS.md / system prompt) at the repo-root [SKILL.md](SKILL.md) — the operator manual for AI agents (degradation tiers, standard flows, session model, constraints).
 
-**Manual (other agents / no plugin)**: clone the repo, `pip install -e <repo path>`, and point your project's `CLAUDE.md` at the repo-root [SKILL.md](SKILL.md) (the operator manual for AI agents: degradation tiers, standard flows, session model, constraints).
+Telling your AI "install this skill: https://github.com/Howie-Hoo/browser-agent" works too — it follows the steps above.
 
 ## Configuration
 
