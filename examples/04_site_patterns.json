@@ -1,0 +1,28 @@
+[
+  {
+    "action": "read_site",
+    "domain": "example.com",
+    "comment": "操作前：读该站点的既有经验（平台特征/有效模式/已知陷阱；无则返回已知域名清单）"
+  },
+  {
+    "action": "navigate",
+    "url": "https://example.com",
+    "comment": "导航；若该域名已有经验，响应自动附 site_experience 提示"
+  },
+  {
+    "action": "get_a11y_tree",
+    "comment": "读页面结构，按经验里的选择器/模式操作……"
+  },
+  {
+    "action": "write_site",
+    "domain": "example.com",
+    "aliases": ["示例站"],
+    "patterns": ["列表页 /explore?page=N 直接翻页，无需逐页点击"],
+    "pitfalls": ["图片懒加载：提取 URL 前先 scroll 到底"],
+    "comment": "任务成功后：只写经验证的事实，带日期追加，不覆盖既有条目"
+  },
+  {
+    "action": "list_sites",
+    "comment": "列出全部已积累的站点经验"
+  }
+]

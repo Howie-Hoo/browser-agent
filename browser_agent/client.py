@@ -10,6 +10,12 @@ CLI（pip 安装后为 browser-agent-client；未安装用 python -m browser_age
   browser-agent-client run <json文件或JSON字符串>
   browser-agent-client check <类型>
   browser-agent-client reset
+  browser-agent-client stop-session        关闭本客户端会话（多任务共享服务时用它代替 shutdown）
+  browser-agent-client sites               列出已积累的站点经验
+  browser-agent-client sites <域名或URL>   读取该站点经验
+  browser-agent-client attach --discover   列出可附着的本机浏览器（含远程调试开关状态）
+  browser-agent-client attach <数据目录>   保存附着偏好并以 attach 模式启动服务
+  browser-agent-client attach --forget     清除附着偏好
   browser-agent-client shutdown
 
 Python API：
@@ -148,13 +154,26 @@ class BrowserAgentClient:
             _log("服务已在运行")
             return True
 
-        # 资源预检 fail-fast：低配机器余量不足时拒绝拉起 Chromium，防整机被压垮
-        from .utils import check_system_resources
+        # 已保存附着偏好 → 以 attach 模式启动（附着用户日常浏览器，登录态免费）
+        attach_args = []
+        from . import browser_attach
+        pref = browser_attach.read_preference()
+        if os.getenv("BROWSER_AGENT_MODE") == "attach" or (pref["attach_dir"] or pref["cdp_endpoint"]):
+            attach_args = ["--attach"]
+            if pref["attach_dir"]:
+                attach_args.append(f"--attach-dir={pref['attach_dir']}")
+            if pref["cdp_endpoint"]:
+                attach_args.append(f"--cdp-endpoint={pref['cdp_endpoint']}")
+            _log(f"attach 模式：将附着 {pref['attach_dir'] or pref['cdp_endpoint']}")
+        else:
+            # 资源预检 fail-fast：低配机器余量不足时拒绝拉起 Chromium，防整机被压垮。
+            # attach 模式不拉浏览器，跳过预检
+            from .utils import check_system_resources
 
-        ok, detail = check_system_resources()
-        if not ok:
-            _log(f"资源预检未通过：{detail}")
-            return False
+            ok, detail = check_system_resources()
+            if not ok:
+                _log(f"资源预检未通过：{detail}")
+                return False
 
         _log(f"启动服务 → :{self.port} | {self.base_url} | {'无头' if self.headless else '有头'}")
         cmd = [
@@ -162,7 +181,7 @@ class BrowserAgentClient:
             f"--port={self.port}",
             f"--url={self.base_url}",
             f"--slow-mo={self.slow_mo}",
-        ]
+        ] + attach_args
         if self.headless:
             cmd.append("--headless")
 
@@ -208,10 +227,14 @@ class BrowserAgentClient:
 
     # ── 执行 ──────────────────────────────────────────────
 
-    def run(self, commands: Union[list, dict, str], compact: bool = False, report: bool = True) -> dict:
+    def run(self, commands: Union[list, dict, str], compact: bool = False, report: bool = True,
+            context: Optional[str] = None) -> dict:
         """
-        发送命令批次，返回富报告。命令路由到 self.session_id 对应的隔离会话。
+        发送命令批次，返回富报告。命令路由到 self.session_id 对应的会话。
 
+        :param context: "isolated"（默认，隔离 context）或 "user"（共享 default
+                        context；attach 模式=用户真实 profile，登录态免费）。
+                        会话已存在时此参数被忽略（沿用建立时的模式）。
         返回字段：ok, session_id, executed_at, steps, screenshots, errors, summary, report_file
         compact=True 时精简响应（不含完整 data 和截图路径）。
         report=False 时跳过报告文件生成。
@@ -221,12 +244,12 @@ class BrowserAgentClient:
             return {"ok": False, "error": "服务未运行", "steps": [], "screenshots": [], "errors": []}
 
         _log(f"发送 {len(commands)} 条命令...")
+        payload = {"commands": commands, "compact": compact, "report": report,
+                   "session_id": self.session_id, "owner": self.owner}
+        if context:
+            payload["context"] = context
         try:
-            r = self._http.post(
-                f"{self._base}/run",
-                json={"commands": commands, "compact": compact, "report": report,
-                      "session_id": self.session_id, "owner": self.owner},
-            )
+            r = self._http.post(f"{self._base}/run", json=payload)
             try:
                 result = r.json()
             except Exception as e_json:
@@ -266,8 +289,12 @@ class BrowserAgentClient:
             _log(f"报告: {result['report_file']}")
         return result
 
-    def session_start(self, url: str = "") -> dict:
-        """启动/获取本客户端的隔离会话（多任务共享服务时各占一个 context）。"""
+    def session_start(self, url: str = "", context: Optional[str] = None) -> dict:
+        """启动/获取本客户端会话。
+
+        :param context: "isolated"（默认）或 "user"（共享 default context；
+                        attach 模式=用户真实 profile，登录态免费）
+        """
         if not self.ensure_service_running():
             return {"ok": False, "error": "服务未运行"}
         payload = {
@@ -277,6 +304,8 @@ class BrowserAgentClient:
             "headless": self.headless,
             "slow_mo": self.slow_mo,
         }
+        if context:
+            payload["context"] = context
         try:
             r = self._http.post(f"{self._base}/session/start", json=payload)
             return r.json()
@@ -309,6 +338,59 @@ class BrowserAgentClient:
             return result
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+    # ── 站点经验 ──────────────────────────────────────────
+
+    def sites(self) -> dict:
+        """列出已积累的站点经验。"""
+        if not self.ensure_service_running():
+            return {"ok": False, "error": "服务未运行"}
+        try:
+            r = self._http.get(f"{self._base}/sites", timeout=10)
+            return r.json()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def read_site(self, domain_or_url: str) -> dict:
+        """读取目标站点经验（域名或 URL，自动匹配子域名/别名）。"""
+        if not self.ensure_service_running():
+            return {"ok": False, "error": "服务未运行"}
+        try:
+            r = self._http.get(f"{self._base}/site", params={"domain": domain_or_url}, timeout=10)
+            return r.json()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # ── 附着日常浏览器 ────────────────────────────────────
+
+    def attach_discover(self) -> dict:
+        """列出本机可附着的浏览器（含远程调试开关状态）。"""
+        from . import browser_attach
+        return {"ok": True, "browsers": browser_attach.discover_browsers(),
+                "remedy": browser_attach.REMEDY_STEPS}
+
+    def attach(self, target: str = "") -> bool:
+        """保存附着偏好并以 attach 模式（重新）启动服务。
+
+        :param target: 浏览器数据目录或 CDP 端点；空串 = 沿用已存偏好启动
+        """
+        from . import browser_attach
+        if target:
+            is_endpoint = "://" in target
+            if not is_endpoint:
+                target = browser_attach.expand_path(target)
+                if not browser_attach.is_browser_data_dir(target):
+                    _err(browser_attach.format_attach_error(browser_attach.error_response(
+                        f"目录不是浏览器数据目录（缺少 Local State）: {target}",
+                        candidates=browser_attach.discover_browsers())))
+                    return False
+            browser_attach.save_preference(
+                attach_dir="" if is_endpoint else target,
+                cdp_endpoint=target if is_endpoint else "",
+            )
+            _log(f"附着偏好已保存: {target}")
+        # 偏好已变 → 重启服务使其按新偏好连接（复用统一重启语义）
+        return self.restart_service()
 
     def shutdown(self) -> bool:
         """优雅关闭服务（浏览器 + HTTP 服务）。"""
@@ -420,9 +502,42 @@ def main():
             result = client.reset_session()
             sys.exit(0 if result.get("ok") else 1)
 
+        elif sub == "stop-session":
+            result = client.stop_session()
+            sys.exit(0 if result.get("ok") else 1)
+
+        elif sub == "sites":
+            if pos:
+                result = client.read_site(pos[0])
+                if result.get("matched"):
+                    print(f"# {result['domain']}（更新于 {result.get('updated','-')}，匹配方式 {result.get('match_type')}）")
+                    print(result.get("content", "（无内容）"))
+                else:
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                result = client.sites()
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            sys.exit(0 if result.get("ok") else 1)
+
+        elif sub == "attach":
+            # --discover 列出本机浏览器；--forget 清除偏好；带参数 = 保存偏好并启动
+            discover = "--discover" in args[1:]
+            forget = "--forget" in args[1:]
+            if discover:
+                res = client.attach_discover()
+                print(json.dumps(res, ensure_ascii=False, indent=2))
+                sys.exit(0)
+            if forget:
+                from . import browser_attach
+                browser_attach.save_preference(attach_dir="", cdp_endpoint="")
+                _log("附着偏好已清除（下次 start 回到 managed 模式）")
+                sys.exit(0)
+            target = pos[0] if pos else ""
+            sys.exit(0 if client.attach(target) else 1)
+
         else:
             _err(f"未知子命令: {sub}")
-            print("可用: status | start | run | check | shutdown | reset")
+            print("可用: status | start | run | check | reset | stop-session | sites | attach | shutdown")
             sys.exit(1)
 
 

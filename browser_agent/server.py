@@ -5,23 +5,29 @@
 基于 aiohttp 的纯异步 HTTP 微服务，持久运行 Playwright 浏览器实例。
 
 端点：
-  GET  /status          健康检查
-  POST /session/start   启动/重配会话
+  GET  /status          健康检查（含浏览器模式 / 站点经验列表 / 用户数据目录）
+  POST /session/start   启动/重配会话（context=isolated|user）
   POST /session/reset   重置页面（保留浏览器）
   POST /run             执行命令批次
   POST /check           预设检验套件
+  GET  /sites           站点经验列表
+  GET  /site            读取站点经验（?domain= 或 ?url=）
+  POST /site            追加站点经验
+  GET  /attach/discover 列出可附着的本机浏览器
+  POST /attach/select   保存附着偏好
   POST /shutdown        优雅关闭
 
 启动：
   python -m browser_agent.server [--port=7788] [--url=http://...] [--headless] [--slow-mo=N]
+                                 [--attach [--attach-dir=<浏览器数据目录> | --cdp-endpoint=<端点>]]
   # pip 安装后等价：browser-agent-server [--port=7788] ...
 """
 import asyncio
 import sys
+from contextlib import asynccontextmanager
 import json
 import os
 import time
-import uuid
 import signal
 from datetime import datetime
 from typing import Optional
@@ -39,6 +45,8 @@ except ImportError:
 
 from .proxy import BrowserProxy
 from .utils import report_dir
+from . import site_patterns
+from . import user_data
 from . import __version__ as _VERSION
 _SERVICE_NAME = "browser_agent"
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -63,16 +71,24 @@ DEFAULT_SESSION = "default"
 
 
 class Session:
-    """一个隔离会话 = 浏览器内独立 context + page 集 + 自己的 active tab。
+    """一个会话 = page 集 + 自己的 active tab + context 归属模式。
 
-    多任务共享同一 Chromium 实例：context 隔离 cookie/storage，命令批在
-    _run_lock 上排队执行，执行前切换到该会话的 active tab——排到时页面状态完好。
+    context_mode：
+    - "isolated"：独占一个 browser context（cookie/storage 与他人互不干扰）
+    - "user"：落在共享 default context（managed=启动 context；attach=用户真实
+      profile——登录态免费）。关闭时只关自建标签页，绝不 close 共享 context。
+
+    多任务共享同一浏览器实例：命令批**按会话加锁**——不同会话的批真并行
+    （proxy 的 contextvar 标签上下文保证各批路由到各自的页），同一会话内
+    串行（页面状态有序变更）。
     """
 
-    def __init__(self, sid: str, owner: str = "", tab: str = "default"):
+    def __init__(self, sid: str, owner: str = "", tab: str = "default",
+                 context_mode: str = "isolated"):
         self.sid = sid
         self.owner = owner
         self.active_tab = tab      # proxy._pages 中的键（含 sid 前缀）
+        self.context_mode = context_mode
         self.created_at = time.time()
         self.last_active = time.time()
 
@@ -93,34 +109,108 @@ class AppState:
             "slow_mo": 0,
             "viewport_w": 1440,
             "viewport_h": 900,
+            "mode": "managed",          # managed=自拉隔离 Chromium | attach=附着用户日常浏览器
+            "attach_dir": "",           # attach：浏览器用户数据目录（含 Local State 那层）
+            "cdp_endpoint": "",         # attach：显式 CDP 端点（高级，优先于 attach_dir）
+            "stealth_enabled": True,
         }
         self.macros = {}
         self.stream_clients = set()
         self._broker_lock = asyncio.Lock()
-        self._run_lock = asyncio.Lock()  # O2: 并发请求安全锁（命令批排队）
+        # O2（升级）：命令批按**会话**排队——不同会话的批真并行（contextvar 标签
+        # 上下文隔离操作目标页），同一会话内仍串行（页面状态有序变更）
+        self._session_locks: dict = {}
+        self._registry_lock = asyncio.Lock()  # 会话注册的 check-and-create 互斥
+        self._inflight = 0                    # 正在执行的命令批数（关停排水用）
 
-    def _tab_key(self, sid: str, tab: str) -> str:
-        return tab if sid == DEFAULT_SESSION else f"{sid}::{tab}"
+    def session_lock(self, sid: str) -> asyncio.Lock:
+        """会话级命令锁（按需创建；创建互斥防两个请求各造一把）。"""
+        lock = self._session_locks.get(sid)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[sid] = lock
+        return lock
+
+    async def _acquire_session_lock(self, sid: str,
+                                     timeout_sec: Optional[int] = None) -> Optional[asyncio.Lock]:
+        """带超时获取会话锁。timeout None/0 = 无限等待；超时返回 None（排队失败）。
+
+        命令执行路径用 QUEUE_TIMEOUT_SEC；控制路径（stop/reset/refresh）用短超时——
+        会话忙（有命令批在跑）时拒绝而不是干等，防止控制请求被长批卡死。
+        返回已持有的锁或 None；调用方负责 release。
+        """
+        lock = self.session_lock(sid)
+        timeout = QUEUE_TIMEOUT_SEC if timeout_sec is None else timeout_sec
+        if timeout <= 0:
+            await lock.acquire()
+            return lock
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=timeout)
+            return lock
+        except asyncio.TimeoutError:
+            return None
+
+    def _resolve_active_tab(self, sess: Session) -> Optional[str]:
+        """会话当前应操作的页键：active_tab 有效则用之，否则回落到名下任一存留页。"""
+        if sess.active_tab in self.proxy._pages:
+            return sess.active_tab
+        return next(iter(self._session_pages(sess.sid)), None)
+
+    def _session_pages(self, sid: str) -> list:
+        """会话名下的页面键：sid 前缀键 + 初始页（default 会话的 'default' / 其余会话的裸 sid 键）。"""
+        if not self.proxy:
+            return []
+        own = [k for k in self.proxy._pages if k.startswith(f"{sid}::")]
+        if sid in self.proxy._pages and sid not in own:
+            own.append(sid)
+        return own
+
+    @asynccontextmanager
+    async def session_batch(self, sid: str, control: bool = False):
+        """命令批/控制操作的会话锁协议：获取 → 锁内重钉 → 保证释放。
+
+        control=True 用短时限（忙时拒绝，不被长批卡死）；否则用 QUEUE_TIMEOUT。
+        yield True（持锁）或 False（忙/超时，调用方返回自己的错误报文）。
+        """
+        timeout = CONTROL_LOCK_TIMEOUT_SEC if control else None
+        acquired = await self._acquire_session_lock(sid, timeout_sec=timeout)
+        try:
+            if acquired and sid in self.sessions:
+                # 锁内重钉：同会话的前一批可能换了页（new_tab 等），必须以拿锁后
+                # 的会话 active_tab 为准；router 带 sid → dispatch 命名空间生效
+                tab = self._resolve_active_tab(self.sessions[sid])
+                if tab is not None:
+                    self.proxy._begin_batch(sid, tab)
+            yield acquired is not None
+        finally:
+            if acquired is not None:
+                acquired.release()
 
     def _session_context(self, sid: str):
-        """会话对应的 browser context（default 会话 = 浏览器自带 default context）。"""
+        """会话对应的 browser context（user 模式 / default 会话 = 共享 default context）。"""
         if not self.proxy:
             return None
-        return self.proxy._contexts.get("default" if sid == DEFAULT_SESSION else sid)
+        sess = self.sessions.get(sid)
+        if sid == DEFAULT_SESSION or (sess and sess.context_mode == "user"):
+            return self.proxy._contexts.get("default")
+        return self.proxy._contexts.get(sid)
 
     async def ensure_proxy(self, cfg: Optional[dict] = None):
         """启动浏览器（幂等）。锁保护整个创建流程，防止并发启动。"""
         async with self._broker_lock:
             if self.proxy is not None and self.proxy.is_browser_open():
                 return
-            # 资源预检兜底（client 侧已查，此处防直接 HTTP 调 server 绕过）：
-            # 低配机器余量不足时拒绝拉起 Chromium，防整机被压垮
-            from .utils import check_system_resources
-
-            ok, detail = check_system_resources()
-            if not ok:
-                raise RuntimeError(f"资源预检未通过：{detail}")
             c = {**self.config, **(cfg or {})}
+            attach_mode = c.get("mode") == "attach"
+            if not attach_mode:
+                # 资源预检兜底（client 侧已查，此处防直接 HTTP 调 server 绕过）：
+                # 低配机器余量不足时拒绝拉起 Chromium，防整机被压垮。
+                # attach 模式不拉浏览器、几乎零内存开销，跳过预检
+                from .utils import check_system_resources
+
+                ok, detail = check_system_resources()
+                if not ok:
+                    raise RuntimeError(f"资源预检未通过：{detail}")
             self.proxy = BrowserProxy(
                 base_url=c["base_url"],
                 headless=c["headless"],
@@ -132,26 +222,89 @@ class AppState:
                 record_har_path=c.get("record_har_path"),
                 no_storage=c.get("no_storage", False),
                 ignore_https_errors=c.get("ignore_https_errors", False),
+                mode="attach" if attach_mode else "managed",
+                attach_dir=c.get("attach_dir", ""),
+                cdp_endpoint=c.get("cdp_endpoint", ""),
+                stealth_enabled=c.get("stealth_enabled", True),
+                storage_guard=self._shared_context_refusal,
             )
-            await self.proxy.start()
+            try:
+                await self.proxy.start()
+            except BaseException:
+                # 启动失败（附着被拒/端点死/资源不足…）：清掉半启动实例，
+                # 防泄漏 playwright driver 子进程；下次请求重建
+                try:
+                    await self.proxy.stop()
+                except Exception:
+                    pass
+                self.proxy = None
+                raise
             self.sessions.clear()
             # 首个（通常是 default）会话直接落在浏览器自带的 default context 上
-            self._register_session(DEFAULT_SESSION)
-            _log(f"浏览器已启动，初始会话: {self.session_id}")
+            self._register_session(DEFAULT_SESSION, context_mode="user")
+            _log(f"浏览器已就绪（{self.proxy.mode}），初始会话: {self.session_id}")
 
-    def _register_session(self, sid: str, owner: str = "") -> Session:
-        """登记会话（active tab 指向其 context 的首个 page）。"""
+    def _register_session(self, sid: str, owner: str = "", tab: Optional[str] = None,
+                          context_mode: str = "isolated") -> Session:
+        """登记会话。tab 缺省按 context 归属自动探测（歧义场景务必显式传入）。"""
         ctx = self._session_context(sid)
-        tab = next((k for k, p in self.proxy._pages.items() if p.context is ctx), "default")
-        sess = Session(sid, owner, tab=tab)
+        if tab is None:
+            tab = next((k for k, p in self.proxy._pages.items()
+                        if p.context is ctx and self._page_owner(k) in (None, sid)), "default")
+        sess = Session(sid, owner, tab=tab, context_mode=context_mode)
         self.sessions[sid] = sess
         if not self.session_id:
             self.session_id = sid
         return sess
 
-    async def ensure_session(self, sid: str, owner: str = "") -> tuple:
-        """确保会话存在（不存在则在现有浏览器上开独立 context）。
+    def _page_owner(self, page_key: str) -> Optional[str]:
+        """页面键归属的会话：'sid::tab' → sid；裸键（default / 会话初始页）→ None（歧义）。"""
+        if "::" in page_key:
+            return page_key.split("::", 1)[0]
+        return None
 
+
+
+    def _shared_context_refusal(self, sid: str) -> Optional[str]:
+        """storage 清除类操作（session/refresh、clear_storage）的共享上下文守卫。
+
+        返回拒绝原因；None = 允许。规则：
+        - isolated 会话独占 context → 允许
+        - user 模式（default context）在 attach 下 = 用户真实浏览器 → 拒绝
+        - user 模式在 managed 下与他人（default 会话或其他 user 会话）共享 → 拒绝
+        - user 模式独占（仅 default 会话自身，legacy 单会话用法）→ 允许
+        """
+        sess = self.sessions.get(sid)
+        if not sess or sess.context_mode != "user":
+            return None
+        if self.proxy is not None and self.proxy._shared_default_context:
+            return ("当前会话运行在用户日常浏览器上下文（attach/user），拒绝清除——"
+                    "会波及用户真实登录态")
+        sharers = sorted(s.sid for s in self.sessions.values() if s.context_mode == "user")
+        if len(sharers) > 1:
+            return f"default context 由多个会话共享 {sharers}，清除会波及他人"
+        return None
+
+    async def _heal_session_page(self, sess: Session) -> None:
+        """user 模式会话的初始页已被关闭时，在共享 default context 内重开（无断点自愈）。"""
+        if sess.context_mode != "user" or not self.proxy:
+            return
+        if sess.active_tab in self.proxy._pages:
+            return
+        ctx = self.proxy._contexts.get("default")
+        if not ctx:
+            return
+        await self.proxy._register_page(ctx, sess.active_tab, label=f"session:{sess.sid}")
+        _log(f"会话 {sess.sid} 初始页已失效，已在 default context 重开")
+
+    async def ensure_session(self, sid: str, owner: str = "",
+                             context_mode: str = "isolated") -> tuple:
+        """确保会话存在。
+
+        :param context_mode: "isolated"（默认，独占 context，cookie/storage 隔离）；
+                             "user"（共享 default context——attach 模式即用户真实
+                             profile，登录态免费；关闭时只关自建标签页）。
+                             DEFAULT_SESSION 恒为 "user"。
         返回 (session, created, warning)。浏览器级配置（headless/viewport 等）只在
         浏览器冷启动时生效——浏览器已在运行时新会话沿用现有实例，返回 warning 说明。
         """
@@ -161,60 +314,108 @@ class AppState:
         await self.ensure_proxy()
         if sid in self.sessions:
             sess = self.sessions[sid]
+            await self._heal_session_page(sess)
             sess.touch()
             return sess, False, None
 
-        # 新会话：在共享浏览器上开隔离 context（独立 cookie/storage）
-        if sid == DEFAULT_SESSION:
-            # default 的 context 由浏览器启动时创建，这里只补登记（浏览器刚重启等场景）
-            sess = self._register_session(sid, owner)
+        # check-and-create 互斥：同 sid 并发首请求只建一次会话
+        async with self._registry_lock:
+            if sid in self.sessions:  # 双检：等锁期间可能已被并发请求创建
+                sess = self.sessions[sid]
+                sess.touch()
+                return sess, True, warnings
+            if sid == DEFAULT_SESSION:
+                # default 的 context 由浏览器启动时创建，这里只补登记（浏览器刚重启等场景）
+                sess = self._register_session(sid, owner, context_mode="user")
+                await self._heal_session_page(sess)
+                return sess, True, warnings
+
+            if context_mode == "user":
+                res = await self.proxy.new_shared_session(sid)
+                if not res.get("ok", True):
+                    return None, False, res.get("error", "创建共享会话失败")
+                sess = self._register_session(sid, owner, tab=sid, context_mode="user")
+                return sess, True, warnings
+
+            # 新会话：在共享浏览器上开隔离 context（独立 cookie/storage）
+            res = await self.proxy.new_isolated_session(sid)
+            if not res.get("ok", True):
+                return None, False, res.get("error", "创建会话上下文失败")
+            sess = self._register_session(sid, owner, tab=sid, context_mode="isolated")
             return sess, True, warnings
 
-        res = await self.proxy.new_isolated_session(sid)
-        if not res.get("ok", True):
-            return None, False, res.get("error", "创建会话上下文失败")
-        sess = self._register_session(sid, owner)
-        return sess, True, warnings
-
     def switch_to_session(self, sid: str) -> bool:
-        """把 proxy 的 active tab 切到该会话的 tab（命令执行前调用）。"""
+        """把本任务上下文的操作目标切到该会话的 tab（命令执行前调用）。
+
+        实际页路由由 proxy 的 contextvar 完成（每个命令批任务独立），这里只做
+        校验与会话回落；并发批互不影响。
+        """
         sess = self.sessions.get(sid)
         if not sess or not self.proxy:
             return False
-        pages = self.proxy._pages
-        if sess.active_tab in pages:
-            self.proxy._active_tab = sess.active_tab
-        else:
-            # 会话的 page 已被关闭：按 context 归属回落到该会话任一存留 tab
-            ctx = self._session_context(sid)
-            fallback = next((k for k, p in pages.items() if p.context is ctx), None)
-            if fallback is None:
-                return False
-            sess.active_tab = fallback
-            self.proxy._active_tab = fallback
+        tab = self._resolve_active_tab(sess)
+        if tab is None:
+            return False
+        sess.active_tab = tab
+        self.proxy._begin_batch(sid, tab)
         sess.touch()
         self.session_id = sid
         return True
 
-    async def close_session(self, sid: str) -> dict:
-        """关闭单个会话（只关自己的 context，不动其他会话）。
+    async def close_session(self, sid: str, shutdown_if_last: bool = True) -> dict:
+        """关闭单个会话（只关自己名下的页面/context，不动其他会话）。
 
-        最后一个会话关闭时顺带关闭整个浏览器（单任务场景行为与旧版一致）。
+        - isolated 会话：close 自己的 context（其下页面随之关闭）
+        - user 会话 / default 会话：只关自建标签页，绝不 close 共享 default context；
+          attach 模式下它就是用户的日常浏览器 profile
+        - 最后一个会话关闭且 shutdown_if_last：managed 关浏览器；attach 断开连接
+          （用户浏览器保持运行）。attach 的空闲回收传 False——清标签页但连接永驻
         """
         sess = self.sessions.pop(sid, None)
         if not self.proxy or not sess:
             return {"ok": True, "closed": sid, "note": "会话不存在或已关闭"}
-        ctx = self._session_context(sid)
-        if ctx:
-            # context.close() 自动关闭其下全部 page；注册表按 context 归属清理
-            for key in [k for k, p in list(self.proxy._pages.items()) if p.context is ctx]:
-                self.proxy._pages.pop(key, None)
+        shared = sess.context_mode == "user"
+        pages = self.proxy._pages
+        adopted = self.proxy._adopted_tabs
+        if shared:
+            for key in self._session_pages(sid):
+                if key in adopted:
+                    # 用户收养的标签页：只取消注册，绝不当用户的页关掉
+                    pages.pop(key, None)
+                    adopted.discard(key)
+                    self.proxy._purge_tab_state(key)
+                    continue
+                page = pages.pop(key, None)
+                self.proxy._purge_tab_state(key)
+                if page is not None:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+        else:
+            ctx = self.proxy._contexts.get(sid)
+            if ctx:
+                # context.close() 自动关闭其下全部 page；注册表按 context 归属清理
+                for key in [k for k, p in list(pages.items()) if p.context is ctx]:
+                    pages.pop(key, None)
+                    self.proxy._purge_tab_state(key)
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
+                self.proxy._contexts.pop(sid, None)
+        # 批内 new_isolated_session 建的 context（键为 sid::name）一并回收，防泄漏
+        for ck in [k for k in list(self.proxy._contexts)
+                   if k.startswith(BrowserProxy.tab_key(sid, ""))]:
+            ctx = self.proxy._contexts.pop(ck)
+            for key in [k for k, p in list(pages.items()) if p.context is ctx]:
+                pages.pop(key, None)
+                self.proxy._purge_tab_state(key)
             try:
                 await ctx.close()
             except Exception:
                 pass
-            self.proxy._contexts.pop("default" if sid == DEFAULT_SESSION else sid, None)
-        if not self.sessions and self.proxy:
+        if not self.sessions and self.proxy and shutdown_if_last:
             await self.shutdown_browser()
             return {"ok": True, "closed": sid, "browser_shutdown": True}
         if self.session_id == sid:
@@ -226,18 +427,12 @@ class AppState:
         sess = self.sessions.get(sid)
         if not self.proxy or not sess:
             return "会话不存在"
-        ctx = self._session_context(sid)
+        ctx = self.proxy._contexts.get(
+            "default" if sess.context_mode == "user" else sid)
         if not ctx:
             return "会话上下文不存在"
         old = self.proxy._pages.get(sess.active_tab)
-        from playwright_stealth import Stealth
-        page = await ctx.new_page()
-        await Stealth().apply_stealth_async(page)
-        page.set_default_timeout(self.proxy.default_timeout)
-        page.on("crash", lambda p: _log(f"⚠️ 会话 {sid} 页面崩溃！状态已失效"))
-        page.on("download", self.proxy._on_download)
-        self.proxy._pages[sess.active_tab] = page
-        self.proxy._active_tab = sess.active_tab
+        await self.proxy._register_page(ctx, sess.active_tab, label=f"session:{sid}")
         if old:
             try:
                 await old.close()
@@ -247,6 +442,15 @@ class AppState:
         _log(f"会话 {sid} 页面已重置")
         return ""
 
+    def _effective_idle_sec(self) -> int:
+        """空闲回收阈值（两模式共用，BROWSER_AGENT_IDLE_SHUTDOWN_SEC 控制，0=禁用）。
+
+        调用时动态读 env（改环境变量即时生效，无需重启服务）。回收的语义按模式
+        区分（见 idle_recycle）：managed 关浏览器；attach 只关超时会话的自建
+        标签页、**连接保持**——新式开关下每条新连接都要用户在浏览器里重新授权。
+        """
+        return _env_int("BROWSER_AGENT_IDLE_SHUTDOWN_SEC", IDLE_SHUTDOWN_SEC)
+
     def sessions_info(self) -> list:
         now = time.time()
         return [
@@ -254,6 +458,7 @@ class AppState:
                 "session_id": s.sid,
                 "owner": s.owner,
                 "active_tab": s.active_tab,
+                "context_mode": s.context_mode,
                 "idle_sec": int(now - s.last_active),
                 "age_sec": int(now - s.created_at),
             }
@@ -261,31 +466,53 @@ class AppState:
         ]
 
     async def idle_recycle(self):
-        """所有会话空闲超阈值 → 关闭浏览器释放内存（HTTP 服务保留，下次自动重启浏览器）。"""
-        if IDLE_SHUTDOWN_SEC <= 0 or not self.sessions:
+        """所有会话空闲超阈值 → 回收（HTTP 服务保留）。
+
+        - managed：关闭 Chromium 释放内存（下次请求自动重启）
+        - attach：只关超时会话的自建标签页与隔离 context，**CDP 连接保持不断**——
+          重连需要用户在浏览器里再次授权；同时防 agent 异常退出留下的孤儿标签页
+        """
+        idle_sec = self._effective_idle_sec()
+        if idle_sec <= 0 or not self.sessions:
+            return
+        # 在途命令批存在（含单步长命令如 watch_for_change 数分钟）→ 不回收，
+        # 防止把正在执行的批腰斩（显式 /shutdown 走排水路径）
+        if self._inflight > 0:
             return
         now = time.time()
-        # 任一会话仍在活跃期即不回收（须所有会话全部超时才关浏览器）
-        if any(now - s.last_active < IDLE_SHUTDOWN_SEC for s in self.sessions.values()):
+        # 任一会话仍在活跃期即不回收（须所有会话全部超时才回收）
+        if any(now - s.last_active < idle_sec for s in self.sessions.values()):
             return
         idle = {s.sid: int(now - s.last_active) for s in self.sessions.values()}
-        _log(f"空闲回收：所有会话超时无活动 {idle}，关闭浏览器（{IDLE_SHUTDOWN_SEC}s 阈值）")
+        if self.proxy.mode == "attach":
+            _log(f"空闲回收（attach）：会话 {list(idle)} 的自建标签页已关闭，连接保持"
+                 f"（断连需用户重新授权；{idle_sec}s 阈值）")
+            for sid in list(self.sessions):
+                await self.close_session(sid, shutdown_if_last=False)
+            self.session_id = None
+            return
+        _log(f"空闲回收：所有会话超时无活动 {idle}，关闭浏览器释放内存（{idle_sec}s 阈值）")
         await self.shutdown_browser()
 
     async def shutdown_browser(self):
+        attached = self.proxy.mode == "attach"
         if self.proxy:
-            # auto_save：在 stop() 之前保存活跃会话（storage_state 需活跃 context）
+            # auto_save：在 stop() 之前保存活跃会话（storage_state 需活跃 context）。
+            # 安全边界：活跃页位于共享用户上下文（attach/user）时跳过——
+            # 不把用户日常浏览器的全部登录态悄悄落盘
             if self.config.get("auto_save_state") and self.proxy._page:
-                try:
-                    storage_dir = os.path.join(os.path.dirname(__file__), "storage")
-                    state_path = os.path.join(storage_dir, "state.json")
-                    await self.proxy.save_storage(state_path)
-                    ap = getattr(self.proxy, "_active_profile", None)
-                    if ap:
-                        await self.proxy.save_profile(ap)
-                    _log(f"auto_save 已落盘 state.json{' + profile ' + ap if ap else ''}")
-                except Exception as e:
-                    _log(f"auto_save 失败: {e}")
+                if self.proxy._in_user_context():
+                    _log("auto_save 跳过：活跃页在共享用户上下文（attach/user），不导出用户全部登录态")
+                else:
+                    try:
+                        state_path = user_data.state_file()
+                        await self.proxy.save_storage(state_path)
+                        ap = self.proxy._active_profile_name()
+                        if ap:
+                            await self.proxy.save_profile(ap)
+                        _log(f"auto_save 已落盘 state.json{' + profile ' + ap if ap else ''}")
+                    except Exception as e:
+                        _log(f"auto_save 失败: {e}")
             try:
                 await self.proxy.stop()
             except Exception:
@@ -293,7 +520,7 @@ class AppState:
             self.proxy = None
             self.session_id = None
             self.sessions.clear()
-        _log("浏览器已关闭")
+        _log("已断开浏览器连接（用户浏览器保持运行）" if attached else "浏览器已关闭")
 
 
 _state = AppState()
@@ -390,14 +617,32 @@ def _apply_token_budget(step_record: dict, max_chars: int) -> dict:
     return step_record
 
 
-async def execute_commands(commands: list, out_dir: str, compact: bool = False, generate_report: bool = True) -> dict:
+async def execute_commands(commands: list, out_dir: str, compact: bool = False,
+                           generate_report: bool = True, session_id: str = "unknown") -> dict:
+    _state._inflight += 1
+    try:
+        return await _execute_commands_inner(commands, out_dir, compact, generate_report, session_id)
+    finally:
+        _state._inflight -= 1
+
+
+async def _execute_commands_inner(commands, out_dir, compact, generate_report,
+                                   session_id) -> dict:
     proxy = _state.proxy
-    session_id = _state.session_id or "unknown"
+    sess = _state.sessions.get(session_id)
     steps, screenshots, errors = [], [], []
 
+    # 会话页失效时回落到名下任一存留页（与 switch_to_session 同一解析逻辑）
+    if sess is not None and _state._resolve_active_tab(sess) is None:
+        return {"ok": False, "session_id": session_id,
+                "error": f"会话 '{session_id}' 无可用页面", "steps": [], "errors": []}
     for i, cmd in enumerate(commands):
         action = cmd.get("action", cmd.get("type", ""))
         comment = cmd.get("comment", "")
+        # 每步开始即刷新活跃时间：单步长命令（如 watch_for_change 数分钟）期间
+        # 会话仍算活跃，不会被空闲回收腰斩正在执行的批
+        if sess is not None:
+            sess.touch()
         _log(f"步骤 {i+1}/{len(commands)}: {action}" + (f" ({comment})" if comment else ""))
         t0 = time.monotonic()
 
@@ -509,6 +754,13 @@ async def execute_commands(commands: list, out_dir: str, compact: bool = False, 
                 timeout_ms = cmd.get("timeout", 60000 if action == "wait_for" else 30000)
             result = await asyncio.wait_for(proxy._dispatch(cmd), timeout=timeout_ms / 1000.0)
             dur = int((time.monotonic() - t0) * 1000)
+            # 命令可能切换了操作目标页（new_tab/switch_tab/adopt_tab/load_profile…）：
+            # 同步回会话，让该会话的下一个批从离开的地方继续
+            if sess is not None:
+                current = proxy._tab()
+                if current:
+                    sess.active_tab = current
+                sess.touch()
             
             # 支持业务层面的 False（如断言失败，或者常规 action 的 success: False）
             is_ok = True
@@ -518,12 +770,24 @@ async def execute_commands(commands: list, out_dir: str, compact: bool = False, 
                     screenshots.append(result["path"])
             
             if is_ok:
-                step_record = {"step": i+1, "action": action, "comment": comment, "ok": True, "data": result, "duration_ms": dur}
-                # navigate 后自动附加页面摘要，让 AI 就烟知道当前在哪里
+                step_record = {"step": i+1, "action": action, "comment": comment, "ok": True, "data": result, "duration_ms": dur, "session_id": session_id}
+                # navigate 后自动附加页面摘要，让 AI 就地知道当前在哪里
                 if action == "navigate" and proxy and proxy._page:
                     try:
                         summary_data = await proxy.get_page_summary()
                         step_record["data"]["page_summary"] = summary_data
+                    except Exception:
+                        pass
+                    # 站点经验提示：目标域名已有积累的经验 → 指引先读取先验
+                    try:
+                        hit = site_patterns.match_site(result.get("url") or "")
+                        if hit.get("matched"):
+                            step_record["data"]["site_experience"] = {
+                                "domain": hit["domain"],
+                                "match_type": hit.get("match_type"),
+                                "updated": hit.get("updated"),
+                                "ai_hint": "该站点已有经验记录，建议先执行 read_site 获取先验（平台特征/有效模式/已知陷阱）",
+                            }
                     except Exception:
                         pass
                 # V6: Token 预算控制 — 截断超大响应以保护 AI 上下文窗口
@@ -639,13 +903,12 @@ async def execute_commands(commands: list, out_dir: str, compact: bool = False, 
     return result
 
 
-async def execute_check(check_type: str, out_dir: str) -> dict:
+async def execute_check(check_type: str, out_dir: str, session_id: str = "unknown") -> dict:
     from .run_check import (
         check_full_screenshot, check_panels, check_dom,
         check_perf, check_a11y, check_interact,
     )
     proxy = _state.proxy
-    session_id = _state.session_id or "unknown"
     screenshots, data = [], {}
     valid = {"full", "panels", "dom", "perf", "a11y", "interact", "all"}
     if check_type not in valid:
@@ -828,45 +1091,68 @@ async def handle_macro_run(request: web.Request) -> web.Response:
         return _json({"ok": False, "error": f"宏 '{name}' 不存在"}, 404)
     sid = _sid_from_body(body)
     try:
-        await _state.ensure_session(sid, str(body.get("owner") or ""))
+        await _state.ensure_session(sid, str(body.get("owner") or ""),
+                                   context_mode=body.get("context") or "isolated")
     except Exception as e:
         return _json({"ok": False, "error": f"浏览器启动失败: {e}"}, 500)
-    _state.switch_to_session(sid)
-    report = await execute_commands(_state.macros[name], report_dir())
+    async with _state.session_batch(sid) as ok:
+        if not ok:
+            return _json({"ok": False, "error": f"排队超时：等待会话 '{sid}' 的前一个命令批（{QUEUE_TIMEOUT_SEC}s）"})
+        report = await execute_commands(_state.macros[name], report_dir(), session_id=sid)
     return _json(report)
 
 async def handle_status(request: web.Request) -> web.Response:
     browser_active = _state.proxy is not None and _state.proxy.is_browser_open()
     page_url = _state.proxy.current_url if browser_active else None
-    return _json({
+    try:
+        sites = site_patterns.list_patterns()
+    except Exception:
+        sites = {"patterns": []}
+    resp = {
         "service": _SERVICE_NAME,
         "version": _VERSION,
         "status": "running",
         "browser_active": browser_active,
+        "browser_mode": _state.config.get("mode", "managed"),
         "session_id": _state.session_id,
         "current_url": page_url,
         "base_url": _state.config["base_url"],
         "headless": _state.config["headless"],
         "port": _state.config["port"],
         "sessions": _state.sessions_info(),
+        "active_batches": _state._inflight,
         "queue_timeout_sec": QUEUE_TIMEOUT_SEC,
-        "idle_shutdown_sec": IDLE_SHUTDOWN_SEC,
-    })
+        "idle_shutdown_sec": _state._effective_idle_sec(),
+        # 前置检查输出站点经验列表：确定目标网站后先读对应先验（SKILL.md 契约）
+        "site_patterns": [p["domain"] for p in sites.get("patterns", [])],
+        "user_data_dir": user_data.data_dir(),
+    }
+    if browser_active and _state.proxy is not None:
+        attach_info = getattr(_state.proxy, "_attach_info", None)
+        if attach_info:
+            resp["attach"] = attach_info
+    return _json(resp)
 
 
 async def handle_session_start(request: web.Request) -> web.Response:
-    """启动/获取会话 — 单 Chromium 多会话隔离模型。
+    """启动/获取会话 — 单 Chromium 多会话模型。
 
-    浏览器未运行则拉起（实例级配置生效）；已在运行则在其上为本会话开独立
-    context（cookie/storage 互不干扰）。多任务命令批在 _run_lock 上排队执行。
+    浏览器未运行则拉起（实例级配置生效）；已在运行则在其上为本会话开
+    context。context=isolated（默认，cookie/storage 互不干扰）或
+    context=user（共享 default context；attach 模式即用户真实 profile，
+    登录态免费，关闭时只关自建标签页）。多任务命令批按会话并行（同会话内串行保序）。
     """
     body = await _read_body(request)
     sid = str(body.get("session_id") or DEFAULT_SESSION)
     for k in ("base_url", "headless", "slow_mo", "viewport_w", "viewport_h"):
         if k in body:
             _state.config[k] = body[k]
+    context_mode = body.get("context") or "isolated"
+    if context_mode not in ("isolated", "user"):
+        return _json({"ok": False, "error": "context 必须是 'isolated' 或 'user'"})
     try:
-        sess, created, warning = await _state.ensure_session(sid, str(body.get("owner") or ""))
+        sess, created, warning = await _state.ensure_session(
+            sid, str(body.get("owner") or ""), context_mode=context_mode)
         if sess is None:
             return _json({"ok": False, "error": warning or "会话创建失败"})
         _state.switch_to_session(sid)
@@ -874,6 +1160,7 @@ async def handle_session_start(request: web.Request) -> web.Response:
             "ok": True,
             "session_id": sid,
             "created": created,
+            "context_mode": sess.context_mode,
             "base_url": _state.config["base_url"],
             "headless": _state.config["headless"],
             "active_sessions": len(_state.sessions),
@@ -885,29 +1172,42 @@ async def handle_session_start(request: web.Request) -> web.Response:
         return _json({"ok": False, "error": str(e)}, 500)
 
 
+# 控制操作（reset/stop/refresh）等待会话锁的短时限：会话忙（有命令批在跑）时
+# 拒绝而不是干等，防止控制请求被长批卡死
+CONTROL_LOCK_TIMEOUT_SEC = 10
+
+
 async def handle_session_reset(request: web.Request) -> web.Response:
     """重置会话页面（当前会话 context 内新开 page，cookie/storage 一并清空）。"""
     body = await _read_body(request)
     sid = str(body.get("session_id") or DEFAULT_SESSION)
-    try:
-        err = await _state.reset_session_page(sid)
-        if err:
-            return _json({"ok": False, "error": err})
-        return _json({"ok": True, "session_id": sid})
-    except Exception as e:
-        return _json({"ok": False, "error": str(e)}, 500)
+    async with _state.session_batch(sid, control=True) as ok:
+        if not ok:
+            return _json({"ok": False,
+                          "error": f"会话 '{sid}' 忙（有命令批在执行），稍后重试"})
+        try:
+            err = await _state.reset_session_page(sid)
+            if err:
+                return _json({"ok": False, "error": err})
+            return _json({"ok": True, "session_id": sid})
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 500)
 
 
 async def handle_session_stop(request: web.Request) -> web.Response:
     """关闭单个会话（只关自己的 context；最后一个会话关闭时顺带关浏览器，HTTP 服务保留）。"""
     body = await _read_body(request)
     sid = str(body.get("session_id") or DEFAULT_SESSION)
-    try:
-        res = await _state.close_session(sid)
-        res["message"] = "会话已关闭" + ("，浏览器随之关闭（最后一个会话）" if res.get("browser_shutdown") else "，浏览器仍在运行（其他会话活跃）")
-        return _json(res)
-    except Exception as e:
-        return _json({"ok": False, "error": str(e)}, 500)
+    async with _state.session_batch(sid, control=True) as ok:
+        if not ok:
+            return _json({"ok": False,
+                          "error": f"会话 '{sid}' 忙（有命令批在执行），稍后重试"})
+        try:
+            res = await _state.close_session(sid)
+            res["message"] = "会话已关闭" + ("，浏览器随之关闭（最后一个会话）" if res.get("browser_shutdown") else "，浏览器仍在运行（其他会话活跃）")
+            return _json(res)
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 500)
 
 
 async def handle_session_refresh(request: web.Request) -> web.Response:
@@ -918,16 +1218,21 @@ async def handle_session_refresh(request: web.Request) -> web.Response:
         proxy = _state.proxy
         if not proxy or sid not in _state.sessions or not _state.switch_to_session(sid):
             return _json({"ok": False, "error": "无活跃页面"}, 400)
-        context = proxy._page.context
-        await context.clear_cookies()
-        await proxy._page.evaluate("""() => {
-            localStorage.clear();
-            sessionStorage.clear();
-        }""")
-        proxy._elements_cache = []
-        _state.sessions[sid].touch()
-        _log(f"会话 {sid} 已刷新（cookies + storage 已清除）")
-        return _json({"ok": True, "session_id": sid})
+        refusal = _state._shared_context_refusal(sid)
+        if refusal:
+            return _json({
+                "ok": False,
+                "error": refusal,
+                "ai_hint": "需要干净环境时改用隔离会话（session/start 传 context=isolated）",
+            })
+        async with _state.session_batch(sid, control=True) as ok:
+            if not ok:
+                return _json({"ok": False,
+                              "error": f"会话 '{sid}' 忙（有命令批在执行），稍后重试"})
+            await proxy._clear_live_storage()
+            _state.sessions[sid].touch()
+            _log(f"会话 {sid} 已刷新（cookies + storage 已清除）")
+            return _json({"ok": True, "session_id": sid})
     except Exception as e:
         return _json({"ok": False, "error": str(e)}, 500)
 
@@ -935,7 +1240,7 @@ async def handle_session_refresh(request: web.Request) -> web.Response:
 async def handle_run(request: web.Request) -> web.Response:
     body = await _read_body(request)
     if not body:
-        return _json({"success": False, "ok": False, "error": "无效的 JSON 请求体"}, 400)
+        return _json({"success": False, "ok": False, "error": "缺少 commands 字段或请求体为空"}, 400)
 
     commands = body.get("commands", body.get("steps", []))
     if not commands:
@@ -945,36 +1250,38 @@ async def handle_run(request: web.Request) -> web.Response:
 
     sid = _sid_from_body(body)
     try:
-        await _state.ensure_session(sid, str(body.get("owner") or ""))
+        await _state.ensure_session(sid, str(body.get("owner") or ""),
+                                   context_mode=body.get("context") or "isolated")
     except Exception as e:
         return _json({"success": False, "ok": False, "error": f"浏览器启动失败: {e}"}, 500)
-    if not _state.switch_to_session(sid):
-        return _json({"success": False, "ok": False, "error": f"会话 '{sid}' 无可用页面"}, 400)
-
-    acquired = await _acquire_run_lock()
-    if not acquired:
-        return _json({
-            "success": False, "ok": False,
-            "error": f"排队超时：等待其他会话的命令批完成超过 {QUEUE_TIMEOUT_SEC}s（当前活跃会话 '{_state.session_id}'；可用 BROWSER_AGENT_QUEUE_TIMEOUT 调整）",
-        })
-    try:
+    async with _state.session_batch(sid) as ok:
+        if not ok:
+            return _json({
+                "success": False, "ok": False,
+                "error": f"排队超时：等待会话 '{sid}' 的前一个命令批完成超过 {QUEUE_TIMEOUT_SEC}s"
+                         f"（同一会话串行执行；可用 BROWSER_AGENT_QUEUE_TIMEOUT 调整）",
+            })
+        # 锁内重钉已由 session_batch 完成（前一批可能换了页）；
+        # 页面全失效时报无可用页面
+        if sid in _state.sessions and _state.sessions[sid].active_tab not in _state.proxy._pages:
+            return _json({"success": False, "ok": False, "error": f"会话 '{sid}' 无可用页面"}, 400)
         # 若页面空白且无 navigate 指令则自动导航
-        has_nav = any(c.get("action", c.get("type", "")) == "navigate" for c in commands)
-        if not has_nav and _state.proxy.current_url in ("about:blank", ""):
-            commands = [{"action": "navigate", "url": _state.config["base_url"]}] + commands
+        try:
+            has_nav = any(c.get("action", c.get("type", "")) == "navigate" for c in commands)
+            if not has_nav and _state.proxy.current_url in ("about:blank", ""):
+                commands = [{"action": "navigate", "url": _state.config["base_url"]}] + commands
 
-        report = await execute_commands(
-            commands, report_dir(),
-            compact=body.get("compact", False),
-            generate_report=body.get("report", True),
-        )
-        return _json(report)
-    except Exception as e:
-        import traceback
-        err_msg = traceback.format_exc().split('\n')[-2]
-        return _json({"success": False, "ok": False, "error": f"执行崩溃: {err_msg}"}, 500)
-    finally:
-        _state._run_lock.release()
+            report = await execute_commands(
+                commands, report_dir(),
+                compact=body.get("compact", False),
+                generate_report=body.get("report", True),
+                session_id=sid,
+            )
+            return _json(report)
+        except Exception as e:
+            import traceback
+            err_msg = traceback.format_exc().split('\n')[-2]
+            return _json({"success": False, "ok": False, "error": f"执行崩溃: {err_msg}"}, 500)
 
 
 async def handle_check(request: web.Request) -> web.Response:
@@ -985,41 +1292,52 @@ async def handle_check(request: web.Request) -> web.Response:
 
     sid = _sid_from_body(body)
     try:
-        await _state.ensure_session(sid, str(body.get("owner") or ""))
+        await _state.ensure_session(sid, str(body.get("owner") or ""),
+                                   context_mode=body.get("context") or "isolated")
     except Exception as e:
         return _json({"success": False, "ok": False, "error": f"浏览器启动失败: {e}"}, 500)
-    if not _state.switch_to_session(sid):
-        return _json({"success": False, "ok": False, "error": f"会话 '{sid}' 无可用页面"}, 400)
-
-    acquired = await _acquire_run_lock()
-    if not acquired:
-        return _json({"success": False, "ok": False, "error": f"排队超时（{QUEUE_TIMEOUT_SEC}s）"})
-    try:
-        if _state.proxy.current_url in ("about:blank", ""):
-            await _state.proxy.navigate(_state.config["base_url"])
-        report = await execute_check(check_type, report_dir())
-        return _json(report)
-    except Exception as e:
-        import traceback
-        err_msg = traceback.format_exc().split('\n')[-2]
-        return _json({"success": False, "ok": False, "error": f"检查崩溃: {err_msg}"}, 500)
-    finally:
-        _state._run_lock.release()
+    async with _state.session_batch(sid) as ok:
+        if not ok:
+            return _json({"success": False, "ok": False,
+                          "error": f"排队超时：等待会话 '{sid}' 的前一个命令批（{QUEUE_TIMEOUT_SEC}s）"})
+        if sid in _state.sessions and _state.sessions[sid].active_tab not in _state.proxy._pages:
+            return _json({"success": False, "ok": False, "error": f"会话 '{sid}' 无可用页面"}, 400)
+        try:
+            if _state.proxy.current_url in ("about:blank", ""):
+                await _state.proxy.navigate(_state.config["base_url"])
+            report = await execute_check(check_type, report_dir(), session_id=sid)
+            return _json(report)
+        except Exception as e:
+            import traceback
+            err_msg = traceback.format_exc().split('\n')[-2]
+            return _json({"success": False, "ok": False, "error": f"检查崩溃: {err_msg}"}, 500)
 
 
 async def handle_shutdown(request: web.Request) -> web.Response:
     resp = _json({"ok": True, "message": "正在关闭..."})
-    asyncio.get_event_loop().call_later(0.3, lambda: asyncio.ensure_future(_do_shutdown(request.app)))
+    asyncio.get_event_loop().call_later(0.3, lambda: asyncio.ensure_future(_do_shutdown()))
     return resp
 
 
-async def _do_shutdown(app):
+async def _do_shutdown():
+    """优雅关停：排水（等在途命令批收尾）→ 浏览器落盘/关闭 → SIGTERM 退出。
+
+    不能在 handler task 里调 app.shutdown()/app.cleanup()（自等死锁，进程不退——
+    旧版即此 bug，一直靠 cleanup.sh 的 pkill 兜底）；也不能直接 loop.stop()——
+    新版 aiohttp 的 run_app 用 run_until_complete 包着 main_task，强停会抛
+    RuntimeError。SIGTERM 是 run_app 注册的官方优雅退出通道。
+    """
+    # 排水：在途命令批最多等 10s；超时则如实记录并继续（shutdown 是显式意图）
+    deadline = time.time() + 10
+    while _state._inflight > 0 and time.time() < deadline:
+        await asyncio.sleep(0.2)
+    if _state._inflight > 0:
+        _log(f"关停排水超时：仍有 {_state._inflight} 个命令批在执行，继续关停")
     await _state.shutdown_browser()
     _remove_pid()
-    await app.shutdown()
-    await app.cleanup()
-    # run_app 的事件循环不因 cleanup 而停，须显式 stop 才真正退出进程
-    asyncio.get_event_loop().stop()
+    # Windows 无 add_signal_handler；os.kill(pid, SIGTERM) 在 Windows 即 TerminateProcess——
+    # 浏览器落盘/关闭已在上方完成，此处仅终止进程本体，语义等价
+    os.kill(os.getpid(), signal.SIGTERM)
 
 
 def _json(data: dict, status: int = 200) -> web.Response:
@@ -1050,34 +1368,16 @@ def _sid_from_body(body: dict) -> str:
     return sid or DEFAULT_SESSION
 
 
-async def _acquire_run_lock() -> bool:
-    """带超时获取命令批执行锁（多任务排队；超时返回 False 防无限堆积）。"""
-    if QUEUE_TIMEOUT_SEC <= 0:
-        await _state._run_lock.acquire()
-        return True
-    try:
-        await asyncio.wait_for(_state._run_lock.acquire(), timeout=QUEUE_TIMEOUT_SEC)
-        return True
-    except asyncio.TimeoutError:
-        return False
-
-
 # ─────────────────────────────────────────────────────────
 # 认证会话端点（profile 管理）
 # ─────────────────────────────────────────────────────────
 async def handle_auth_profiles(request: web.Request) -> web.Response:
-    """GET /auth/profiles — 列出所有 profile 元数据（不含 storage_state 内容）。"""
+    """GET /auth/profiles — 列出所有 profile 元数据（纯文件读，无需浏览器与锁）。"""
     try:
         await _state.ensure_proxy()
     except Exception as e:
         return _json({"ok": False, "error": f"浏览器启动失败: {e}"})
-    acquired = await _acquire_run_lock()
-    if not acquired:
-        return _json({"ok": False, "error": f"排队超时（{QUEUE_TIMEOUT_SEC}s）"})
-    try:
-        res = await _state.proxy.list_profiles()
-    finally:
-        _state._run_lock.release()
+    res = await _state.proxy.list_profiles()
     return _json(res)
 
 
@@ -1086,21 +1386,96 @@ async def handle_auth_ensure(request: web.Request) -> web.Response:
     body = await _read_body(request)
     sid = _sid_from_body(body)
     try:
-        await _state.ensure_session(sid, str(body.get("owner") or ""))
+        await _state.ensure_session(sid, str(body.get("owner") or ""),
+                                   context_mode=body.get("context") or "isolated")
     except Exception as e:
         return _json({"ok": False, "error": f"浏览器启动失败: {e}"})
-    if not _state.switch_to_session(sid):
-        return _json({"ok": False, "error": f"会话 '{sid}' 无可用页面"})
-    acquired = await _acquire_run_lock()
-    if not acquired:
-        return _json({"ok": False, "error": f"排队超时（{QUEUE_TIMEOUT_SEC}s）"})
-    try:
+    async with _state.session_batch(sid) as ok:
+        if not ok:
+            return _json({"ok": False, "error": f"排队超时：等待会话 '{sid}' 的前一个命令批（{QUEUE_TIMEOUT_SEC}s）"})
+        if sid in _state.sessions and _state.sessions[sid].active_tab not in _state.proxy._pages:
+            return _json({"ok": False, "error": f"会话 '{sid}' 无可用页面"})
         res = await _state.proxy.ensure_auth(
             body.get("profile"), body.get("login_commands"), body.get("into", "new")
         )
-    finally:
-        _state._run_lock.release()
     return _json(res)
+
+
+# ─────────────────────────────────────────────────────────
+# 站点经验端点（纯文件操作，无需浏览器）
+# ─────────────────────────────────────────────────────────
+async def handle_sites_list(request: web.Request) -> web.Response:
+    """GET /sites — 已积累的站点经验列表。"""
+    return _json(site_patterns.list_patterns())
+
+
+async def handle_site_get(request: web.Request) -> web.Response:
+    """GET /site?domain=（或 ?url=）— 匹配并返回站点经验全文。"""
+    target = request.query.get("domain") or request.query.get("url") or ""
+    if not target:
+        return _json({"ok": False, "error": "需要 domain 或 url 查询参数"})
+    return _json(site_patterns.match_site(target))
+
+
+async def handle_site_write(request: web.Request) -> web.Response:
+    """POST /site {domain, aliases?, platform?, patterns?, pitfalls?} — 追加站点经验（带日期）。"""
+    body = await _read_body(request)
+    domain = body.get("domain") or body.get("url")
+    if not domain:
+        return _json({"ok": False, "error": "需要 domain 字段"})
+    try:
+        res = site_patterns.write_pattern(
+            domain,
+            aliases=body.get("aliases"),
+            platform=body.get("platform"),
+            patterns=body.get("patterns"),
+            pitfalls=body.get("pitfalls"),
+        )
+    except Exception as e:
+        # 恒 200 契约：任何异常转为结构化失败（如 aliases 传了不可迭代对象）
+        return _json({"ok": False, "error": f"写入失败: {str(e).splitlines()[0]}"})
+    if res.get("ok"):
+        _log(f"站点经验已更新: {res.get('domain')}（+{res.get('appended_entries')} 条）")
+    return _json(res)
+
+
+# ─────────────────────────────────────────────────────────
+# 附着偏好端点（attach 模式）
+# ─────────────────────────────────────────────────────────
+async def handle_attach_select(request: web.Request) -> web.Response:
+    """POST /attach/select {attach_dir | cdp_endpoint | forget} — 保存/清除附着偏好。
+
+    偏好落 ~/.browser-agent/attach.env；服务需重启（shutdown 后自动拉起）才按新偏好连接。
+    """
+    from . import browser_attach
+    body = await _read_body(request)
+    if body.get("forget"):
+        browser_attach.save_preference(attach_dir="", cdp_endpoint="")
+        return _json({"ok": True, "message": "附着偏好已清除"})
+    attach_dir = body.get("attach_dir") or ""
+    cdp_endpoint = body.get("cdp_endpoint") or ""
+    if not attach_dir and not cdp_endpoint:
+        return _json({
+            "ok": False,
+            "error": "需要 attach_dir 或 cdp_endpoint（或 forget: true 清除偏好）",
+            "candidates": browser_attach.discover_browsers(),
+        })
+    if attach_dir:
+        attach_dir = browser_attach.expand_path(attach_dir)
+        if not browser_attach.is_browser_data_dir(attach_dir):
+            return _json(browser_attach.error_response(
+                f"目录不是浏览器数据目录（缺少 Local State）: {attach_dir}",
+                candidates=browser_attach.discover_browsers()))
+    res = browser_attach.save_preference(attach_dir=attach_dir, cdp_endpoint=cdp_endpoint)
+    res["message"] = "偏好已保存；重启服务后按新偏好连接（POST /shutdown 后下次请求自动拉起）"
+    return _json(res)
+
+
+async def handle_attach_discover(request: web.Request) -> web.Response:
+    """GET /attach/discover — 列出本机可附着的浏览器（含远程调试开关状态）。"""
+    from . import browser_attach
+    return _json({"ok": True, "browsers": browser_attach.discover_browsers(),
+                  "remedy": browser_attach.REMEDY_STEPS})
 
 
 # ─────────────────────────────────────────────────────────
@@ -1135,6 +1510,10 @@ def main():
     no_storage = False
     auto_save_state = False
     ignore_https_errors = False
+    mode = "managed"
+    attach_dir = ""
+    cdp_endpoint = ""
+    stealth_enabled = True
 
     # 配置查找顺序：BROWSER_AGENT_CONFIG 指定路径 → 仓库根 browser_agent.yaml（包目录上一级）
     config_file = os.getenv("BROWSER_AGENT_CONFIG") or os.path.join(_HERE, "..", "browser_agent.yaml")
@@ -1158,6 +1537,11 @@ def main():
             record_video_dir = y.get("record_video_dir", record_video_dir)
             record_har_path = y.get("record_har_path", record_har_path)
             ignore_https_errors = bool(browser_cfg.get("ignore_https_errors", y.get("ignore_https_errors", ignore_https_errors)))
+            mode = str(browser_cfg.get("mode", y.get("mode", mode)) or "managed")
+            attach_dir = str(browser_cfg.get("attach_dir", y.get("attach_dir", attach_dir)) or "")
+            cdp_endpoint = str(browser_cfg.get("cdp_endpoint", y.get("cdp_endpoint", cdp_endpoint)) or "")
+            stealth_cfg = y.get("stealth", {})
+            stealth_enabled = bool(stealth_cfg.get("enabled", True))
             # auto_load_state 配置
             storage_cfg = y.get("storage", {})
             if not storage_cfg.get("auto_load_state", True):
@@ -1168,12 +1552,18 @@ def main():
         except Exception as e:
             print(f"[警告] 读取 yaml 配置失败: {e}", file=sys.stderr)
 
+    cli_attach = False
     for a in args:
         if a == "--headless":
             headless = True
             slow_mo = 0
         elif a == "--no-storage":
             no_storage = True
+        elif a == "--attach":
+            mode = "attach"
+            cli_attach = True
+        elif a == "--no-stealth":
+            stealth_enabled = False
         elif a.startswith("--port="):
             port = int(a.split("=")[1])
         elif a.startswith("--url="):
@@ -1182,14 +1572,29 @@ def main():
             slow_mo = int(a.split("=")[1])
         elif a.startswith("--http-proxy="):
             http_proxy = a.split("=", 1)[1]
+        elif a.startswith("--attach-dir="):
+            attach_dir = a.split("=", 1)[1]
+            mode = "attach"
+            cli_attach = True
+        elif a.startswith("--cdp-endpoint="):
+            cdp_endpoint = a.split("=", 1)[1]
+            mode = "attach"
+            cli_attach = True
         elif a.startswith("http://") or a.startswith("https://"):
             base_url = a
 
+    # 优先级 CLI > 环境变量 > 配置文件：附着类参数在解析分支里已置 cli_attach，
+    # 环境变量只在无显式附着参数时改写模式（否则会静默吞掉 --attach）
+    if not cli_attach:
+        mode = os.getenv("BROWSER_AGENT_MODE") or mode
+
     _state.config.update({
-        "port": port, "base_url": base_url, "headless": headless, "slow_mo": slow_mo, 
+        "port": port, "base_url": base_url, "headless": headless, "slow_mo": slow_mo,
         "viewport_w": viewport_w, "viewport_h": viewport_h,
         "http_proxy": http_proxy, "record_video_dir": record_video_dir, "record_har_path": record_har_path,
         "no_storage": no_storage, "auto_save_state": auto_save_state, "ignore_https_errors": ignore_https_errors,
+        "mode": mode, "attach_dir": attach_dir, "cdp_endpoint": cdp_endpoint,
+        "stealth_enabled": stealth_enabled,
     })
 
     app = web.Application()
@@ -1204,6 +1609,11 @@ def main():
     app.router.add_post("/check", handle_check)
     app.router.add_get("/auth/profiles", handle_auth_profiles)
     app.router.add_post("/auth/ensure", handle_auth_ensure)
+    app.router.add_get("/sites", handle_sites_list)
+    app.router.add_get("/site", handle_site_get)
+    app.router.add_post("/site", handle_site_write)
+    app.router.add_get("/attach/discover", handle_attach_discover)
+    app.router.add_post("/attach/select", handle_attach_select)
     app.router.add_post("/macro/save", handle_macro_save)
     app.router.add_post("/macro/run", handle_macro_run)
     app.router.add_get("/macro/list", handle_macro_list)
@@ -1211,22 +1621,28 @@ def main():
 
     async def on_startup(app):
         _write_pid(port)
-        # 浏览器拉起失败（资源预检等）不阻断 HTTP 服务：服务常驻，
-        # 资源允许后首个带会话的请求会自动重新拉起浏览器
-        try:
-            await _state.ensure_proxy()
-            # 启动时自动导航到 base_url，避免白屏
-            if base_url:
-                try:
-                    await _state.proxy.navigate(base_url)
-                except Exception as e:
-                    _log(f"初始导航失败: {e}")
-        except Exception as e:
-            _log(f"浏览器暂不启动：{e}")
-            _log("HTTP 服务正常监听，资源允许后首个请求会自动拉起浏览器")
+        if mode == "attach":
+            # attach 惰性连接：服务就绪即返回，首个带会话的请求才连用户浏览器。
+            # 不在启动时自动导航（attach 模式不在用户浏览器里凭空开标签页）
+            _log("attach 模式：等待首个请求时连接用户浏览器（偏好由 ~/.browser-agent/attach.env / 环境变量解析）")
+        else:
+            # 浏览器拉起失败（资源预检等）不阻断 HTTP 服务：服务常驻，
+            # 资源允许后首个带会话的请求会自动重新拉起浏览器
+            try:
+                await _state.ensure_proxy()
+                # 启动时自动导航到 base_url，避免白屏
+                if base_url:
+                    try:
+                        await _state.proxy.navigate(base_url)
+                    except Exception as e:
+                        _log(f"初始导航失败: {e}")
+            except Exception as e:
+                _log(f"浏览器暂不启动：{e}")
+                _log("HTTP 服务正常监听，资源允许后首个请求会自动拉起浏览器")
 
         _log(f"服务已启动 → http://127.0.0.1:{port}")
-        _log(f"目标地址: {base_url} | 模式: {'无头' if headless else '有头（可见）'}")
+        _log(f"目标地址: {base_url} | 模式: "
+             f"{'attach（附着日常浏览器）' if mode == 'attach' else ('无头' if headless else '有头（可见）')}")
 
         async def _heartbeat():
             while True:

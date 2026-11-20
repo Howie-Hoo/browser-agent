@@ -85,7 +85,8 @@ def check_system_resources() -> tuple[bool, str]:
         try:
             if os.getloadavg()[0] > float(max_load):
                 return False, f"系统负载 {os.getloadavg()[0]:.2f} 超过 BROWSER_AGENT_MAX_LOAD={max_load}，拒绝启动浏览器"
-        except (OSError, ValueError):
+        except (AttributeError, OSError, ValueError):
+            # Windows 无 os.getloadavg（AttributeError）——跳过负载检查，保持可用性优先
             pass
     return True, f"资源预检通过（可用内存 {available:.0f}MB）"
 
@@ -93,6 +94,16 @@ def check_system_resources() -> tuple[bool, str]:
 # ── 报告产物目录 ──────────────────────────────────────────
 # BROWSER_AGENT_REPORT_DIR 覆盖；默认落在仓库根 temp/（包随 pip 装进
 # site-packages 时退回当前工作目录，不向 site-packages 写文件）
+def safe_join(root: str, name: str, ext: str, kind: str) -> str:
+    """把 name.ext 安全拼进 root：正则已在上游校验，这里做纵深防御——
+    归一化后必须仍落在 root 内（防路径穿越），否则抛 ValueError。
+    profile_path 与 site_patterns.pattern_path 共用。"""
+    full = os.path.normpath(os.path.join(root, name + ext))
+    if os.path.commonpath([root, full]) != root:
+        raise ValueError(f"非法 {kind}（路径穿越）: {name!r}")
+    return full
+
+
 def report_dir() -> str:
     override = os.getenv("BROWSER_AGENT_REPORT_DIR")
     if override:

@@ -107,7 +107,7 @@ async def check_a11y(proxy: BrowserProxy) -> dict:
             if (!btn.textContent.trim() && !btn.getAttribute('aria-label'))
                 issues.push({type: 'empty_button', element: btn.outerHTML.slice(0, 80)});
         });
-        document.querySelectorAll('input[type!=hidden]').forEach(inp => {
+        document.querySelectorAll('input:not([type=hidden])').forEach(inp => {
             const id = inp.id;
             if (id && !document.querySelector('label[for="' + id + '"]')
                 && !inp.getAttribute('aria-label') && !inp.placeholder)

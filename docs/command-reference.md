@@ -72,13 +72,16 @@
 | `screenshot` | `path`, `full_page`, `selector`, `clip` | 全页/区域/元素截图 |
 | `clip_screenshot` | `selector`, `padding` | 元素截图（节省 Token） |
 
-### 多标签页
+### 多标签页与会话
 
 | 命令 | 参数 | 说明 |
 | --- | --- | --- |
-| `new_tab` | `name` | 同 context 新标签（共享 cookie） |
-| `new_isolated_session` | `name` | 隔离 context（独立 cookie） |
-| `switch_tab` / `close_tab` | `name` | 切换/关闭标签 |
+| `new_tab` | `name` | 同 context 新标签（共享 cookie）；多会话下名称自动按会话隔离 |
+| `new_isolated_session` | `name`, `profile?` | 隔离 context（独立 cookie；传 `profile` 同时注入登录态） |
+| `new_shared_session` | `name` | 共享 default context 建会话页（attach 模式=用户真实 profile；关闭只关自建标签页） |
+| `list_user_tabs` | — | 列出 default context 全部标签页（含用户已打开的；attach 模式定位用户 tab） |
+| `adopt_tab` | `index`, `name?`, `activate?=true` | 收养用户已有标签页纳入操作——**仅限用户明确要求时**；收养页只注销绝不关闭 |
+| `switch_tab` / `close_tab` | `name` | 切换/关闭标签（attach 模式自建页切换不抢焦点；收养页激活、close 仅注销） |
 
 ### iframe
 
@@ -109,6 +112,19 @@ profile 机制与项目接入写法见 [`SKILL.md`](../SKILL.md)「认证会话�
 | `check_auth` | `name?` | 按 `auth.check` 判定登录态是否有效（不给 name 则查当前活跃 profile） |
 | `ensure_auth` | `name?`, `login_commands?`, `into?` | profile 有效则复用；否则执行 `login_commands`（任意命令序列）→ 再 check → 落盘 |
 | `new_isolated_session` | `name`, `profile?` | 建隔离 context；传 `profile` 则同时注入其登录态 |
+
+### 站点经验（site-patterns）
+
+机制与读写契约见 [`SKILL.md`](../SKILL.md)「站点经验」。存于 `~/.browser-agent/site-patterns/`，纯文件操作，无需浏览器。
+
+| 命令 | 参数 | 说明 |
+| --- | --- | --- |
+| `list_sites` | — | 列出全部站点经验元数据（域名/别名/更新日期/条目数） |
+| `read_site` | `domain` 或 `url` | 匹配（精确/子域名/别名）并返回经验全文；未命中返回已知域名清单 |
+| `write_site` | `domain`, `aliases?`, `platform?`, `patterns?`, `pitfalls?` | 追加带日期条目（只追加不覆盖；域名做路径穿越校验） |
+| `delete_site` | `domain` | 删除该域名的经验文件 |
+
+`navigate` 到已积累的域名时，响应自动附 `site_experience` 提示（domain/match_type/updated）。
 
 ### 其他
 
@@ -142,20 +158,25 @@ profile 机制与项目接入写法见 [`SKILL.md`](../SKILL.md)「认证会话�
 ## HTTP API
 
 ```text
-GET  /status          健康检查
-POST /session/start   启动/重配会话
+GET  /status          健康检查（含 browser_mode / site_patterns 列表 / user_data_dir）
+POST /session/start   启动/重配会话（context: "isolated" | "user"）
 POST /session/reset   重置页面
-POST /session/refresh 清除当前会话 cookies + storage（保留浏览器）
-POST /session/stop    关闭单个会话（最后一个会话关闭时浏览器随之关闭）
+POST /session/refresh 清除当前会话 cookies + storage（共享用户上下文中拒绝执行）
+POST /session/stop    关闭单个会话（managed 最后一个会话关闭时关浏览器；attach 只断开连接）
 POST /run             执行命令批次
 POST /check           预设检验套件
+GET  /sites           站点经验列表
+GET  /site            读取站点经验（?domain= 或 ?url=，支持子域名/别名匹配）
+POST /site            追加站点经验 {domain, aliases?, platform?, patterns?, pitfalls?}
+GET  /attach/discover 列出可附着的本机浏览器（含远程调试开关状态）
+POST /attach/select   保存附着偏好 {attach_dir | cdp_endpoint | forget}（重启服务后生效）
 POST /macro/save      保存宏
 POST /macro/run       运行宏
 GET  /macro/list      列出宏
 GET  /auth/profiles   列出所有 profile 元数据（不含 token 内容）
 POST /auth/ensure     确保已登录：{profile, login_commands, into} — 失效则执行登录命令并落盘
 GET  /stream          SSE 实时推送
-POST /shutdown        优雅关闭（浏览器 + HTTP 服务）
+POST /shutdown        优雅关闭（浏览器 + HTTP 服务；attach 模式用户浏览器保持运行）
 ```
 
 所有端点恒返 200，逻辑成败看响应体 `ok` 字段。

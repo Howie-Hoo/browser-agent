@@ -4,7 +4,8 @@ from __future__ import annotations
 BrowserProxyAuth — 认证会话管理 Mixin（跨项目通用）
 
 提供「命名 profile」抽象：把一组浏览器登录态（cookies + localStorage）按名字落盘到
-storage/profiles/{name}.json，可跨会话/跨重启恢复，支持多账号隔离。
+~/.browser-agent/profiles/{name}.json（用户数据目录，pip 升级不丢），可跨会话/跨重启
+恢复，支持多账号隔离。
 
 设计原则：**本 mixin 零项目知识**。它不知道 JWT、不知道 localStorage 键名、不知道任何
 登录端点。项目特定的「登录态长什么样」「怎么判定已登录」由 profile 文件里的 `auth.check`
@@ -20,17 +21,11 @@ import time
 from typing import Optional
 
 from .utils import log, emit
+from .user_data import profiles_dir
 
 # profile 名校验：字母/数字/下划线/连字符/点，首字符不能是点或斜杠类，限 63 字符。
 # 拒绝前导点（.bashrc / ../）、斜杠（路径穿越）、空字节等。
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-.]{0,62}$")
-
-# storage/profiles 目录基准（包目录下的 storage/profiles）
-_PROFILES_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage", "profiles"))
-
-
-def profiles_dir() -> str:
-    return _PROFILES_DIR
 
 
 def validate_profile_name(name: str) -> Optional[str]:
@@ -41,15 +36,12 @@ def validate_profile_name(name: str) -> Optional[str]:
 
 
 def profile_path(name: str) -> str:
-    """计算 profile 文件绝对路径，带路径穿越二次校验。"""
+    """计算 profile 文件绝对路径（纵深防御：safe_join 保证仍在 profiles/ 内）。"""
     err = validate_profile_name(name)
     if err:
         raise ValueError(err)
-    full = os.path.normpath(os.path.join(_PROFILES_DIR, name + ".json"))
-    # 纵深防御：即便正则被绕过，也要确保最终路径仍在 profiles/ 目录内
-    if os.path.commonpath([_PROFILES_DIR, full]) != _PROFILES_DIR:
-        raise ValueError(f"非法 profile 名（路径穿越）: {name!r}")
-    return full
+    from .utils import safe_join
+    return safe_join(profiles_dir(), name, ".json", "profile 名")
 
 
 def _read_profile(name: str) -> Optional[dict]:
@@ -76,10 +68,11 @@ class BrowserProxyAuth:
 
     async def list_profiles(self) -> dict:
         """列出所有 profile 元数据。**绝不返回 storage_state 内容**（防凭证泄露 / 爆破响应体积）。"""
-        if not os.path.isdir(_PROFILES_DIR):
+        root = profiles_dir()
+        if not os.path.isdir(root):
             return {"ok": True, "profiles": [], "count": 0}
         items = []
-        for fn in os.listdir(_PROFILES_DIR):
+        for fn in os.listdir(root):
             if not fn.endswith(".json"):
                 continue
             data = _read_profile(fn[:-5])
@@ -120,7 +113,7 @@ class BrowserProxyAuth:
         except Exception as e:
             return {"ok": False, "error": f"导出 storage_state 失败: {str(e).splitlines()[0]}"}
 
-        os.makedirs(_PROFILES_DIR, exist_ok=True)
+        os.makedirs(profiles_dir(), exist_ok=True)
         path = profile_path(name)
         now = time.strftime("%Y-%m-%dT%H:%M:%S")
         # 保留旧 profile 的 created_at 与（include_auth=False 时）auth 块 → 支持「只刷新 token 不动判定规则」
@@ -132,7 +125,7 @@ class BrowserProxyAuth:
             auth_block = old.get("auth")
         if include_auth and auth_block is None:
             # 尝试沿用当前活跃 profile 的 auth 规则
-            active = getattr(self, "_active_profile", None)
+            active = self._active_profile_name()
             if active:
                 ap = _read_profile(active)
                 if ap:
@@ -150,7 +143,7 @@ class BrowserProxyAuth:
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(profile, f, ensure_ascii=False, indent=2)
-        self._active_profile = name
+        self._set_active_profile(name)
         emit({"type": "save_profile", "name": name, "ok": True,
               "cookies": len(state.get("cookies", [])), "origins": len(state.get("origins", []))})
         return {"ok": True, "name": name,
@@ -178,7 +171,6 @@ class BrowserProxyAuth:
             ctx_name = f"profile::{name}"
             if ctx_name in self._contexts or ctx_name in self._pages:
                 return {"ok": False, "error": f"已存在隔离 profile 会话 '{ctx_name}'，请先 close_tab 再加载"}
-            from playwright_stealth import Stealth
             context_args = {"viewport": self.viewport, "storage_state": state}
             if getattr(self, "ignore_https_errors", False):
                 context_args["ignore_https_errors"] = True
@@ -189,17 +181,8 @@ class BrowserProxyAuth:
                 context = await self._browser.new_context(**context_args)
             except Exception as e:
                 return {"ok": False, "error": f"创建 context 失败: {str(e).splitlines()[0]}"}
-            page = await context.new_page()
-            await Stealth().apply_stealth_async(page)
-            page.set_default_timeout(self.default_timeout)
-            page.on("crash", lambda p: log(f"⚠️ profile 会话 '{name}' 页面崩溃"))
-            page.on("download", self._on_download)
-            self._setup_health_listeners(page)
-            self._contexts[ctx_name] = context
-            self._pages[ctx_name] = page
-            self._active_tab = ctx_name
-            self._active_profile = name
-            self._elements_cache = []
+            await self._register_page(context, ctx_name, label=f"profile:{name}")
+            self._set_active_profile(name)
             if navigate and origin:
                 try:
                     await page.goto(origin, wait_until="domcontentloaded")
@@ -226,8 +209,8 @@ class BrowserProxyAuth:
                 await self._page.reload(wait_until="networkidle")
         except Exception as e:
             return {"ok": False, "error": f"注入当前 context 失败: {str(e).splitlines()[0]}"}
-        self._active_profile = name
-        self._elements_cache = []
+        self._set_active_profile(name)
+        self._cache_invalidate()
         emit({"type": "load_profile", "name": name, "into": "current", "ok": True})
         return {"ok": True, "name": name, "into": "current", "origin": origin}
 
@@ -249,16 +232,16 @@ class BrowserProxyAuth:
             ctx_name = f"profile::{name}"
             if ctx_name in self._pages:
                 # profile context 已存在：切过去判定，避免重复 load 触发"已存在会话"报错
-                # _page 是按 _active_tab 取的只读 property，切换 tab 即可
-                self._active_tab = ctx_name
-                self._active_profile = name
-                self._elements_cache = []
+                # _page 按 contextvar 取当前标签页，切换 tab 即可
+                self._set_current_tab(ctx_name)
+                self._set_active_profile(name)
+                self._cache_invalidate()
             else:
                 lp = await self.load_profile(name, into="new", navigate=False)
                 if not lp.get("ok"):
                     return lp
         else:
-            active = getattr(self, "_active_profile", None)
+            active = self._active_profile_name()
             data = _read_profile(active) if active else None
 
         auth = (data or {}).get("auth") or {}

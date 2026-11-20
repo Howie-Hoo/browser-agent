@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
+import contextvars
 import os
 import sys
 from typing import Optional
@@ -25,10 +25,17 @@ from .utils import log, emit
 from .proxy_ai import BrowserProxyAI
 from .proxy_tabs import BrowserProxyTabs
 from .proxy_auth import BrowserProxyAuth
+from .site_patterns import BrowserProxySites
+from . import user_data
 
 
-class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth):
-    """Playwright 浏览器操作封装，由服务端持久托管。"""
+class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth, BrowserProxySites):
+    """Playwright 浏览器操作封装，由服务端持久托管。
+
+    两种模式：
+    - managed（默认）：自拉隔离 Chromium，配合 profile 注入登录态
+    - attach：经 CDP 附着用户日常浏览器（登录态免费，最小侵入契约见 browser_attach.py）
+    """
 
     def __init__(
         self,
@@ -43,6 +50,11 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth):
         record_har_path: Optional[str] = None,
         no_storage: bool = False,
         ignore_https_errors: bool = False,
+        mode: str = "managed",
+        attach_dir: str = "",
+        cdp_endpoint: str = "",
+        stealth_enabled: bool = True,
+        storage_guard=None,
     ):
         self.base_url = base_url.rstrip("/")
         self.headless = headless
@@ -54,34 +66,164 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth):
         self.record_har_path = record_har_path
         self.no_storage = no_storage
         self.ignore_https_errors = ignore_https_errors
+        self.mode = mode
+        self.attach_dir = attach_dir
+        self.cdp_endpoint = cdp_endpoint
+        # attach 模式禁用 stealth：真实用户浏览器即指纹，注入反而画蛇添足
+        self.stealth_enabled = stealth_enabled and mode != "attach"
         self._playwright = None
         self._browser = None
         self._contexts = {}
         self._pages = {}
+        # 当前标签页的权威来源是任务级 ContextVar，值是**可变 router 字典**
+        # （{"tab": 键, "sid": 会话}）：asyncio.wait_for 在 Python < 3.12 会把协程
+        # 包进子任务（复制上下文，ContextVar.set 不回传父任务），而子任务复制的是
+        # router 的**引用**——批内命令（switch_tab 等，运行在 wait_for 之下）对
+        # router 的写入对所有版本都对外层批任务可见。每个批任务入口 set 自己的
+        # router，多会话批真并行互不串页；_active_tab 仅作无 router 时的回退默认。
+        self._current_tab: contextvars.ContextVar = contextvars.ContextVar("ba_current_tab")
         self._active_tab = "default"
-        self._routes = []
+        # storage 清除类操作的服务器侧守卫（构造注入：按 sid 判共享上下文）
+        self._storage_guard = storage_guard
+        # adopt_tab 收养的用户标签页键集合：这些页属于用户，
+        # 服务/会话关闭时只取消注册、绝不关闭它们
+        self._adopted_tabs: set = set()
+        # ── 以下运行态全部按标签页键隔离（并发批不串扰）──
         self._downloads = {}
-        self._frames: dict = {}
-        self._console_errors: list = []
-        self._failed_requests: list = []
-        # O3: 元素缓存
-        self._elements_cache: list = []
-        self._elements_cache_url: str = ""
-        self._elements_cache_time: float = 0
+        self._frames: dict = {}                      # tab_key -> 当前 iframe Frame
+        self._routes: dict = {}                      # tab_key -> [url_pattern]
+        self._console_errors: dict = {}              # tab_key -> 环形缓冲
+        self._failed_requests: dict = {}             # tab_key -> 环形缓冲
+        self._element_caches: dict = {}              # tab_key -> {url, time, data}
+        self._active_profiles: dict = {}             # tab_key -> profile 名
+        # default context 是否与他人共享（attach 模式的用户 profile context）：
+        # 共享则绝不 close 该 context、不抢焦点、不清 storage
+        self._shared_default_context = False
+        self._attach_info: dict = {}
+
+    # ── 标签页上下文（并发模型核心）──────────────────────
+    # 键约定唯一属主："sid::name"。server 与 proxy 都只经这一对函数拼/拆。
+
+    @staticmethod
+    def tab_key(sid: str, name: str) -> str:
+        return f"{sid}::{name}"
+
+    @staticmethod
+    def tab_owner(key: str) -> Optional[str]:
+        return key.split("::", 1)[0] if "::" in key else None
+
+    def _tab(self) -> Optional[str]:
+        """当前任务上下文的标签页键（router 优先，回退全局默认）。"""
+        router = self._current_tab.get(None)
+        if router is not None:
+            return router.get("tab") or self._active_tab
+        return self._active_tab
+
+    def _begin_batch(self, sid: str, tab: str) -> None:
+        """命令批入口：为本任务装上带 sid 的路由上下文（唯一合法写入点）。"""
+        self._current_tab.set({"tab": tab, "sid": sid})
+        self._active_tab = tab
+
+    def _router_sid(self) -> Optional[str]:
+        """当前批所属会话（server 在批入口写入 router；守卫钩子用）。"""
+        router = self._current_tab.get(None)
+        return router.get("sid") if router else None
+
+    def _set_current_tab(self, key: Optional[str]) -> None:
+        """切换当前任务上下文的操作目标页；同时更新回退默认值。
+
+        写入 router（可变字典）：wait_for 子任务内调用也能被外层批任务看到
+        （Python ≥3.10 一致）；本任务没有 router 时创建一个——此后该任务与
+        其他任务完全隔离。
+        """
+        if key is None:
+            return
+        router = self._current_tab.get(None)
+        if router is None:
+            router = {}
+            self._current_tab.set(router)
+        router["tab"] = key
+        self._active_tab = key
+
+    def _purge_tab_state(self, key: str) -> None:
+        """清理某标签页键关联的全部运行态（页已关闭时调用）。"""
+        self._frames.pop(key, None)
+        self._routes.pop(key, None)
+        self._console_errors.pop(key, None)
+        self._failed_requests.pop(key, None)
+        self._element_caches.pop(key, None)
+        self._active_profiles.pop(key, None)
+
+    def _cache_invalidate(self) -> None:
+        """清除当前标签页的元素缓存（改变页面状态的操作后调用）。"""
+        self._element_caches.pop(self._tab(), None)
+
+    def _active_profile_name(self) -> Optional[str]:
+        return self._active_profiles.get(self._tab())
+
+    def _set_active_profile(self, name: str) -> None:
+        self._active_profiles[self._tab()] = name
 
     @property
     def _page(self):
-        return self._frames.get(self._active_tab) or self._pages.get(self._active_tab)
+        key = self._tab()
+        return self._frames.get(key) or self._pages.get(key)
 
     @property
     def _main_page(self):
         """始终返回主页面（绕过 iframe）。"""
-        return self._pages.get(self._active_tab)
+        return self._pages.get(self._tab())
+
+    def _in_user_context(self) -> bool:
+        """当前活跃页是否位于共享的用户 default context。"""
+        p = self._page
+        return bool(
+            self._shared_default_context
+            and p is not None
+            and getattr(p, "context", None) is self._contexts.get("default")
+        )
+
+    async def _apply_stealth(self, page) -> None:
+        """按配置注入 stealth（attach 模式自动跳过）。"""
+        if not self.stealth_enabled:
+            return
+        from playwright_stealth import Stealth
+        await Stealth().apply_stealth_async(page)
+
+    async def _register_page(self, context, key: str, label: str = ""):
+        """在指定 context 建页并注册：stealth / 超时 / 崩溃与下载监听统一在此。
+
+        新页成为当前任务上下文的操作目标（contextvar），并初始化其按页隔离的运行态。
+        """
+        page = await context.new_page()
+        await self._apply_stealth(page)
+        page.set_default_timeout(self.default_timeout)
+        page.on("crash", lambda p: log(f"⚠️ 页面 '{label or key}' 崩溃！状态已失效"))
+        page.on("download", self._on_download)
+        self._pages[key] = page
+        self._set_current_tab(key)
+        self._setup_health_listeners(page, key)
+        return page
 
     async def start(self) -> None:
         from playwright.async_api import async_playwright
         self._playwright = await async_playwright().start()
+        if self.mode == "attach":
+            await self._start_attached()
+        else:
+            await self._start_managed()
 
+        context = self._contexts["default"]
+        self._browser.on("disconnected", lambda browser: log("⚠️ 浏览器连接断开！"))
+        await self._register_page(context, "default", label="default")
+        if self.mode == "attach":
+            log(f"已附着用户浏览器 [{'无头' if self.headless else '有头'}] "
+                f"{self._attach_info.get('browser_dir') or self._attach_info.get('endpoint')}")
+        else:
+            log(f"浏览器已启动 [{'无头' if self.headless else '有头'}] "
+                f"{self.viewport['width']}x{self.viewport['height']}")
+
+    async def _start_managed(self) -> None:
         launch_args = {
             "headless": self.headless,
             "slow_mo": self.slow_mo,
@@ -101,36 +243,59 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth):
         if self.record_har_path:
             os.makedirs(os.path.dirname(os.path.abspath(self.record_har_path)) or ".", exist_ok=True)
 
-        STORAGE_DIR = os.path.join(os.path.dirname(__file__), "storage")
-        DEFAULT_STATE_FILE = os.path.join(STORAGE_DIR, "state.json")
-        if os.path.isfile(DEFAULT_STATE_FILE) and not self.no_storage:
-            context_args["storage_state"] = DEFAULT_STATE_FILE
-            log(f"自动复用持久化会话凭证: {DEFAULT_STATE_FILE}")
+        state_path = user_data.state_file()
+        if os.path.isfile(state_path) and not self.no_storage:
+            context_args["storage_state"] = state_path
+            log(f"自动复用持久化会话凭证: {state_path}")
         elif self.no_storage:
             log("沙箱模式已开启: 本次会话不加载任何持久化状态")
 
-        context = await self._browser.new_context(**context_args)
-        self._contexts["default"] = context
+        self._contexts["default"] = await self._browser.new_context(**context_args)
 
-        page = await context.new_page()
-        from playwright_stealth import Stealth
-        await Stealth().apply_stealth_async(page)
-
-        page.set_default_timeout(self.default_timeout)
-        page.on("crash", lambda p: log("⚠️ 页面崩溃！状态已失效"))
-        page.on("download", self._on_download)
-        self._browser.on("disconnected", lambda browser: log("⚠️ 浏览器进程断开！"))
-        self._pages["default"] = page
-        self._active_tab = "default"
-        self._setup_health_listeners(page)
-        log(f"浏览器已启动 [{'无头' if self.headless else '有头'}] {self.viewport['width']}x{self.viewport['height']}")
+    async def _start_attached(self) -> None:
+        """CDP 附着用户日常浏览器（硬错不降级，契约见 browser_attach 模块头）。"""
+        from .browser_attach import resolve_endpoint, format_attach_error
+        info = resolve_endpoint(self.attach_dir, self.cdp_endpoint)
+        if not info.get("ok"):
+            raise RuntimeError(format_attach_error(info))
+        # 连接超时给足用户在浏览器里点「允许」的时间（Chrome 新式开关每条新连接
+        # 都要授权一次；Playwright 默认 30s 太短，用户来不及点「允许」）。
+        # BROWSER_AGENT_CONNECT_TIMEOUT_MS 可调。
+        try:
+            connect_timeout_ms = int(os.getenv("BROWSER_AGENT_CONNECT_TIMEOUT_MS", "120000"))
+        except ValueError:
+            connect_timeout_ms = 120000
+        self._browser = await self._playwright.chromium.connect_over_cdp(
+            info["endpoint"], timeout=connect_timeout_ms)
+        contexts = self._browser.contexts
+        # 有既有 context = 用户真实 profile（登录态即来自它）→ 共享，只加页不关它
+        self._shared_default_context = bool(contexts)
+        self._contexts["default"] = contexts[0] if contexts else await self._browser.new_context()
+        self._attach_info = {
+            "endpoint": info["endpoint"],
+            "browser_dir": info.get("browser_dir"),
+            "browser_version": self._browser.version,
+            "source": info.get("source"),
+        }
 
     async def stop(self) -> None:
         if self._browser:
+            if self._shared_default_context:
+                # attach：只关自建标签页（adopt_tab 收养的用户页除外），
+                # close() 对连接型浏览器仅断开连接——用户浏览器与其余标签页原样保留
+                for key, page in list(self._pages.items()):
+                    if key in self._adopted_tabs:
+                        continue
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                self._pages.clear()
+                self._adopted_tabs.clear()
             await self._browser.close()
         if self._playwright:
             await self._playwright.stop()
-        log("浏览器已关闭")
+        log("已断开浏览器连接（用户浏览器保持运行）" if self._shared_default_context else "浏览器已关闭")
 
     @property
     def current_url(self) -> str:
@@ -146,24 +311,28 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth):
             return url
         return self.base_url + ("/" if not url.startswith("/") else "") + url
 
-    def _setup_health_listeners(self, page) -> None:
-        """为页面绑定运行时健康监控事件。"""
+    def _setup_health_listeners(self, page, tab_key: Optional[str] = None) -> None:
+        """为页面绑定运行时健康监控事件（缓冲按标签页键隔离，并发批不串扰）。"""
+        key = tab_key or self._tab()
+
         def on_console(msg):
             if msg.type in ("error", "warning"):
-                self._console_errors.append({
+                buf = self._console_errors.setdefault(key, [])
+                buf.append({
                     "type": msg.type, "text": msg.text[:300],
                     "url": (msg.location or {}).get("url", "")
                 })
-                if len(self._console_errors) > 50:
-                    self._console_errors.pop(0)
+                if len(buf) > 50:
+                    buf.pop(0)
 
         def on_request_failed(req):
-            self._failed_requests.append({
+            buf = self._failed_requests.setdefault(key, [])
+            buf.append({
                 "url": req.url[:200],
                 "reason": req.failure or "unknown"
             })
-            if len(self._failed_requests) > 50:
-                self._failed_requests.pop(0)
+            if len(buf) > 50:
+                buf.pop(0)
 
         page.on("console", on_console)
         page.on("requestfailed", on_request_failed)
@@ -444,9 +613,26 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth):
 
     # ── 命令分发 ──────────────────────────────────────────
 
+    # 注册/查找标签页的命令及其键参数——命名空间化的唯一事实来源（server 不再维护清单）
+    _TAB_KEY_ACTIONS = {"new_tab", "switch_tab", "close_tab",
+                        "new_isolated_session", "new_shared_session",
+                        "adopt_tab"}
+    # 注意：load_profile 不在此列——其 name 是 profile 文件名而非标签页名，
+    # 作用域化会破坏 profile 查找（profile::name 页键维持全局共享语义）
+
     async def _dispatch(self, cmd: dict) -> dict:
         action = cmd.get("action", cmd.get("type", ""))
         p = {k: v for k, v in cmd.items() if k not in ("action", "type", "stop_on_error", "comment")}
+
+        # 标签页键按会话命名空间化（sid::name）：在 dispatch 咽喉点统一进行，
+        # /run 主循环、loop 子命令、if_error_then 降级链、ensure_auth 的
+        # login_commands——一切执行路径全部覆盖，多会话不撞键不误关。
+        sid = self._router_sid()
+        if sid and action in self._TAB_KEY_ACTIONS:
+            if action == "new_tab" and not p.get("name"):
+                p["name"] = f"tab_{len(self._pages)}"
+            if "name" in p:
+                p["name"] = self.tab_key(sid, p["name"])
 
         handlers = {
             "navigate":          lambda: self.navigate(p.get("url"), p.get("wait_until", "networkidle")),
@@ -489,16 +675,24 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth):
             # 标签页/持久化/断言（来自 BrowserProxyTabs mixin）
             "new_tab":           lambda: self.new_tab(p.get("name", "tab_" + str(len(self._pages)))),
             "new_isolated_session": lambda: self.new_isolated_session(p["name"], p.get("profile")),
+            "new_shared_session": lambda: self.new_shared_session(p["name"]),
             "switch_tab":        lambda: self.switch_tab(p["name"]),
             "close_tab":         lambda: self.close_tab(p["name"]),
+            "list_user_tabs":    lambda: self.list_user_tabs(),
+            "adopt_tab":         lambda: self.adopt_tab(p["index"], p.get("name", ""), p.get("activate", True)),
             "mock_route":        lambda: self.mock_route(p["url_pattern"], p.get("response_data", {})),
             "clear_routes":      lambda: self.clear_routes(),
             "analyze_network":   lambda: self.analyze_network(),
             "wait_for_download": lambda: self.wait_for_download(p["filename"]),
-            "save_cookies":      lambda: self.save_cookies(p.get("path", os.path.join(os.path.dirname(__file__), "storage", "cookies.json"))),
-            "load_cookies":      lambda: self.load_cookies(p.get("path", os.path.join(os.path.dirname(__file__), "storage", "cookies.json"))),
-            "save_storage":      lambda: self.save_storage(p.get("path", os.path.join(os.path.dirname(__file__), "storage", "state.json"))),
+            "save_cookies":      lambda: self.save_cookies(p.get("path", user_data.cookies_file())),
+            "load_cookies":      lambda: self.load_cookies(p.get("path", user_data.cookies_file())),
+            "save_storage":      lambda: self.save_storage(p.get("path", user_data.state_file())),
             "clear_storage":     lambda: self.clear_storage(),
+            # 站点经验（来自 BrowserProxySites mixin；纯文件操作，无需浏览器）
+            "list_sites":        lambda: self.list_sites(),
+            "read_site":         lambda: self.read_site(p.get("domain") or p.get("url")),
+            "write_site":        lambda: self.write_site(p["domain"], p.get("aliases"), p.get("platform"), p.get("patterns"), p.get("pitfalls")),
+            "delete_site":       lambda: self.delete_site(p["domain"]),
             # 认证会话（来自 BrowserProxyAuth mixin）
             "save_profile":      lambda: self.save_profile(p["name"], p.get("include_auth", True)),
             "load_profile":      lambda: self.load_profile(p["name"], p.get("into", "new"), p.get("navigate", True)),
@@ -543,7 +737,9 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth):
         try:
             res = await handlers[action]()
             if isinstance(res, dict):
-                res["success"] = res.get("success", True)
+                # success 缺省回落 ok：拒绝/失败类结果（如 clear_storage 守卫拒绝）
+                # 只带 ok=false，若默认 success=True 会把失败步骤误判为成功
+                res["success"] = res.get("success", res.get("ok", True))
             # O3: 缓存失效 — 改变页面状态的操作后清除元素缓存
             _CACHE_INVALIDATING_ACTIONS = {
                 "navigate", "click", "click_text", "click_nth", "fill", "type",
@@ -552,7 +748,7 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth):
                 "new_tab", "drag_and_drop", "drag_drop", "hover", "load_profile",
             }
             if action in _CACHE_INVALIDATING_ACTIONS:
-                self._elements_cache = []
+                self._cache_invalidate()
             return res
         except Exception as e:
             err_msg = str(e).split('\n')[0]

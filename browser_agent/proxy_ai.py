@@ -11,7 +11,7 @@ import os
 import time
 from typing import Optional
 
-from .utils import log, emit
+from .utils import emit, report_dir
 
 
 class BrowserProxyAI:
@@ -66,9 +66,8 @@ class BrowserProxyAI:
         }
         """
         annotations = await self._page.evaluate(script)
-        
-        save_path = f"temp/annotated_{int(time.time()*1000)}.png"
-        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+
+        save_path = os.path.join(report_dir(), f"annotated_{int(time.time()*1000)}.png")
         await self._page.screenshot(path=save_path)
         
         await self._page.evaluate("() => { document.querySelectorAll('.__ai_anno_box').forEach(e => e.remove()); }")
@@ -483,7 +482,7 @@ class BrowserProxyAI:
             "ok": True,
             "current_url": page.url if page else "",
             "page_title": await page.title() if page else "",
-            "active_tab": self._active_tab,
+            "active_tab": self._tab(),
             "open_tabs": list(self._pages.keys()),
             "contexts": list(self._contexts.keys()),
             "cookies_count": len(cookies),
@@ -499,14 +498,16 @@ class BrowserProxyAI:
         附带最可靠的 selector 推荐（优先 id > data-testid > name > aria-label）。
         配合 click_by_id 使用，id 字段与 get_annotated_dom 的编号一致。
         """
-        # O3: 元素缓存 — 同页面 2s 内复用
+        # O3: 元素缓存 — 同页面 2s 内复用（按标签页隔离，并发批各用各的）
         import time as _time
         current_url = self._page.url if self._page else ""
         now = _time.monotonic()
-        if _use_cache and self._elements_cache and self._elements_cache_url == current_url and (now - self._elements_cache_time) < 2.0:
-            emit({"type": "get_interactive_elements", "count": len(self._elements_cache), "cached": True})
+        cache = self._element_caches.get(self._tab())
+        if (_use_cache and cache and cache.get("url") == current_url
+                and (now - cache.get("time", 0)) < 2.0):
+            emit({"type": "get_interactive_elements", "count": len(cache["data"]), "cached": True})
             return {
-                "ok": True, "elements": self._elements_cache, "total": len(self._elements_cache),
+                "ok": True, "elements": cache["data"], "total": len(cache["data"]),
                 "cached": True,
                 "ai_hint": "优先使用有 selector 字段的元素直接 click/fill；无 selector 的元素用 click_by_id 通过 id 编号点击"
             }
@@ -549,10 +550,8 @@ class BrowserProxyAI:
         }}
         """
         elements = await self._page.evaluate(script)
-        # O3: 更新元素缓存
-        self._elements_cache = elements
-        self._elements_cache_url = current_url
-        self._elements_cache_time = now
+        # O3: 更新元素缓存（当前标签页）
+        self._element_caches[self._tab()] = {"url": current_url, "time": now, "data": elements}
         emit({"type": "get_interactive_elements", "count": len(elements)})
         return {
             "ok": True, "elements": elements, "total": len(elements),
@@ -672,8 +671,8 @@ class BrowserProxyAI:
         except Exception as e:
             perf = {"error": str(e).split(chr(10))[0]}
 
-        recent_errors = self._console_errors[-20:]
-        recent_failures = self._failed_requests[-20:]
+        recent_errors = self._console_errors.get(self._tab(), [])[-20:]
+        recent_failures = self._failed_requests.get(self._tab(), [])[-20:]
         is_healthy = len(recent_errors) == 0 and len(recent_failures) == 0
 
         emit({"type": "get_page_health", "healthy": is_healthy, "errors": len(recent_errors), "failures": len(recent_failures)})

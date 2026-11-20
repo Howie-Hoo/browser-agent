@@ -11,9 +11,10 @@
 - **Terminal coding agents have no browser.** After changing frontend code, agents like Claude Code can only verify indirectly through test assertions. This service lets them open the real page and check SPA rendering, cookies, auth state, and JS errors — truth, not guesses.
 - **Selectors are brittle.** Semantic `find_and_act` (describe the target in natural language, no selector) plus automatic fuzzy-text self-healing on click timeouts survives UI refactors.
 - **Cold-starting a browser per test is slow.** The service stays resident: one Chromium instance shared end-to-end, each task in an isolated context, command batches queued, idle browser reclaimed automatically.
-- **Login state is a hassle.** Named profiles persist auth (cookies + localStorage + validity rules) to disk — reused across restarts, isolated across accounts.
+- **Login state is a hassle.** Two ways out: named profiles persist auth (cookies + localStorage + validity rules) to disk — reused across restarts, isolated across accounts; or **attach mode** connects straight to your daily browser (Chrome / Edge / Brave / Arc — any Chromium), where login state is free and the fingerprint is real.
+- **Every site starts from scratch.** Site experience accumulates per domain (URL patterns, platform traits, known pitfalls) and is reused across sessions — the tool knows your sites better over time.
 
-Design philosophy: **the tool perceives, the AI decides.**
+Design philosophy: **the tool perceives, the AI decides.** (Operating philosophy / tradeoffs in [SKILL.md](SKILL.md), in Chinese.)
 
 ## How it works
 
@@ -24,10 +25,15 @@ AI agent (Claude Code / Cursor / any program)
 BrowserAgentClient (CLI / Python API; auto-starts & health-checks the service)
    ▼
 browser-agent service (resident aiohttp: resource preflight / batch queueing / idle reclaim)
-   │  single Chromium instance, reused
-   ├─ session A — isolated context (cookies / localStorage separated)
-   ├─ session B — isolated context + auth profile (login state across restarts)
-   └─ always-available primitives: click / fill / eval_js / screenshot
+   │
+   ├─ managed mode: single Chromium instance, reused
+   │    ├─ session A — isolated context (cookies / localStorage separated)
+   │    ├─ session B — isolated context + auth profile (login state across restarts)
+   │    └─ always-available primitives: click / fill / eval_js / screenshot
+   └─ attach mode: CDP-attached to the user's daily browser
+        ├─ context=user sessions — real profile, login state for free
+        ├─ context=isolated sessions — incognito isolation
+        └─ minimal intrusion: never touches user tabs; closes only its own
 ```
 
 **Three-tier degradation** — fall back level by level, never a dead end:
@@ -68,9 +74,20 @@ with BrowserAgentClient(base_url="http://localhost:3000") as client:
     print(report["summary"])
 ```
 
-**CLI:** `status | start | run <json> | check <type> | reset | shutdown`
+**CLI:** `status | start | run <json> | check <type> | reset | stop-session | sites [domain] | attach <dir|--discover|--forget> | shutdown`
 
-Full command reference (40+ commands / 15 HTTP endpoints): [docs/command-reference.md](docs/command-reference.md). More install options (plugin channel, one line to your AI) under [Install](#install).
+Full command reference (45+ commands / 20 HTTP endpoints): [docs/command-reference.md](docs/command-reference.md). More install options (plugin channel, one line to your AI) under [Install](#install).
+
+**Attach your daily browser (attach mode):**
+
+```bash
+playwright install chromium   # only needed for managed mode; attach reuses an existing browser
+browser-agent-client attach --discover                 # list local browsers + remote-debugging status
+browser-agent-client attach "$HOME/Library/Application Support/Google/Chrome"
+```
+
+Prerequisite: open `chrome://inspect/#remote-debugging` in the target browser and tick
+"Allow remote debugging for this browser instance" (a browser restart may be required).
 
 ## Core capabilities
 
@@ -78,9 +95,12 @@ Full command reference (40+ commands / 15 HTTP endpoints): [docs/command-referen
 | --- | --- |
 | Three-tier perception | Semantic → structural → precise primitives, with suggested fallbacks on failure |
 | One browser, many sessions | Single Chromium, N isolated contexts; serialized command batches (`BROWSER_AGENT_QUEUE_TIMEOUT` caps waiting); idle browser auto-reclaimed |
+| Attach to the daily browser | CDP-attach the user's daily Chromium browser: login state for free, real fingerprint, stealth auto-disabled; minimal-intrusion contract (never touches user tabs, never clears user storage, no focus stealing); no fixed-port scanning, hard errors instead of silently switching browsers |
 | Auth profiles | Named login state on disk (Playwright storageState + rule: `url_pattern` / `js` / `cookie_exists`); `ensure_auth` reuses when valid, re-runs your login commands when stale; credentials never leave files/logs |
-| Resource preflight | Memory check (min of host and cgroup v2) before launch; refuses below `BROWSER_AGENT_MIN_FREE_MB` to protect low-spec machines |
-| AI-friendly details | Always HTTP 200 with an `ok` field, automatic failure screenshots + possible_cause, page summary attached to navigations, clip screenshots to save tokens, stealth fingerprint evasion |
+| Site experience | Per-domain operating knowledge (platform traits / proven patterns / known pitfalls, date-stamped); navigations hint at existing entries; `read_site` / `write_site` close the loop in-band; reused across sessions |
+| User data out of the package | Profiles / site experience / state / downloads all live in `~/.browser-agent` — pip upgrades never wipe them; legacy in-package data migrates automatically on first run (copy-only, never overwrites) |
+| Resource preflight | Memory check (min of host and cgroup v2) before launch; refuses below `BROWSER_AGENT_MIN_FREE_MB` to protect low-spec machines (skipped in attach mode) |
+| AI-friendly details | Always HTTP 200 with an `ok` field, automatic failure screenshots + possible_cause, page summary + site-experience hints attached to navigations, clip screenshots to save tokens, stealth fingerprint evasion |
 | Process cleanup | Idempotent cleanup script (`browser-agent-cleanup`); three-layer safety net via pytest conftest / Claude Code Stop hooks |
 
 Profile format and the two-step integration are documented in [SKILL.md](SKILL.md) (in Chinese).
@@ -124,9 +144,20 @@ Copy `config.example.yaml` to `browser_agent.yaml` at the repo root (or set `BRO
 | `BROWSER_AGENT_MIN_FREE_MB` | 768 | Minimum free memory (MB) required to launch the browser |
 | `BROWSER_AGENT_MAX_LOAD` | unchecked | 1-min loadavg ceiling; refuse to start above it |
 | `BROWSER_AGENT_QUEUE_TIMEOUT` | 600 | Max seconds a command batch waits in queue (0 = unlimited) |
-| `BROWSER_AGENT_IDLE_SHUTDOWN_SEC` | 900 | Close the browser after all sessions idle this long (0 = disable) |
+| `BROWSER_AGENT_IDLE_SHUTDOWN_SEC` | 900 | Reclaim after all sessions idle this long (0 = disable, effective immediately): managed closes the browser; attach closes own tabs but **keeps the connection** (reconnecting needs user re-authorization) |
 | `BROWSER_AGENT_REPORT_DIR` | repo temp/ | Output directory for reports / screenshots |
 | `BROWSER_AGENT_CONFIG` | — | Override config file path |
+| `BROWSER_AGENT_HOME` | `~/.browser-agent` | User-data root (profiles / site experience / state / downloads) |
+| `BROWSER_AGENT_MODE` | managed | Set to `attach` to force attach mode |
+| `BROWSER_AGENT_ATTACH_DIR` | — | attach: browser user-data directory (overrides attach.env preference) |
+| `BROWSER_AGENT_CDP_ENDPOINT` | — | attach: explicit CDP endpoint (advanced) |
+
+## Upgrading & data migration
+
+As of v2026.11.20, user data (auth profiles, site experience, session state) lives in
+`~/.browser-agent` and survives pip upgrades/reinstalls; legacy in-package data migrates
+**automatically on first run** (copy-only — never overwrites, never deletes). Verification
+steps and manual commands: [docs/migration-2026.11.20.md](docs/migration-2026.11.20.md).
 
 ## License
 

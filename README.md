@@ -10,10 +10,11 @@
 - **有 computer-use 也未必该用。** 截图 + 坐标点击的循环每步把整页截图塞进上下文，慢且贵；文本化感知信息密度高得多，页面改版也不影响语义定位——表单、导航、校验类任务用结构化操作更稳更省。
 - **终端里的编码代理原生没有浏览器。** Claude Code / Cursor 这类 agent 改完前端代码后，只能靠测试断言间接确认。本服务让它们直接打开真实页面验证：SPA 渲染、cookie、登录态、JS 报错，看的是真相而不是猜。
 - **selector 太脆。** 语义点击 `find_and_act`（用自然语言描述目标，无需 selector）+ 点击超时自动文字模糊匹配自愈，页面改版不至于全线失效。
-- **每次测试冷启动浏览器太慢。** 服务常驻：单 Chromium 实例全程复用，多任务各占隔离 context，批命令排队执行，空闲自动回收内存。
-- **登录态反复造。** 命名 profile 把登录态（cookies + localStorage + 判定规则）落盘复用，跨重启恢复、多账号互不污染。
+- **每次测试冷启动浏览器太慢。** 服务常驻：单 Chromium 实例全程复用，多任务各占隔离 context，跨会话命令批**真并行**（同会话内串行保序），空闲自动回收内存。
+- **登录态反复造。** 两条路：命名 profile 把登录态（cookies + localStorage + 判定规则）落盘复用，跨重启恢复、多账号互不污染；或 **attach 模式**直接附着你的日常浏览器（Chrome / Edge / Brave / Arc…任意 Chromium 内核），登录态免费、指纹真实。
+- **每个站点都从零摸索。** 站点经验按域名自动积累（URL 模式、平台特征、已知陷阱），跨会话复用——工具越用越懂你常去的网站。
 
-设计哲学：**工具负责感知，AI 负责决策。**
+设计哲学：**工具负责感知，AI 负责决策。**（操作哲学 / tradeoff 见 [SKILL.md](SKILL.md)）
 
 ## 工作方式
 
@@ -23,11 +24,16 @@ AI 代理（Claude Code / Cursor / 任意程序）
    ▼
 BrowserAgentClient（CLI / Python API，自动拉起服务 + 健康检查）
    ▼
-browser-agent 服务（aiohttp 常驻：资源预检 / 批级排队 / 空闲回收）
-   │  单 Chromium 实例复用
-   ├─ session A ─ context 隔离（cookie / localStorage 互不干扰）
-   ├─ session B ─ context 隔离 + 认证 profile（登录态跨重启）
-   └─ 底层永远可用：click / fill / eval_js / screenshot
+browser-agent 服务（aiohttp 常驻：资源预检 / 会话级并行调度 / 空闲回收）
+   │
+   ├─ managed 模式：单 Chromium 实例复用
+   │    ├─ session A ─ context 隔离（cookie / localStorage 互不干扰）
+   │    ├─ session B ─ context 隔离 + 认证 profile（登录态跨重启）
+   │    └─ 底层永远可用：click / fill / eval_js / screenshot
+   └─ attach 模式：CDP 附着用户日常浏览器
+        ├─ context=user 会话 ─ 真实 profile，登录态免费
+        ├─ context=isolated 会话 ─ incognito 隔离
+        └─ 最小侵入：未经明确要求不碰用户标签页（明确要求可 adopt_tab 收养），只关自建标签页
 ```
 
 **三层降级**——高层失败逐级回落，永远有路可走：
@@ -68,19 +74,33 @@ with BrowserAgentClient(base_url="http://localhost:3000") as client:
     print(report["summary"])
 ```
 
-**CLI：** `status | start | run <json> | check <type> | reset | shutdown`
+**CLI：** `status | start | run <json> | check <type> | reset | stop-session | sites [域名] | attach <目录|--discover|--forget> | shutdown`
 
-命令全表（40+ 命令 / 15 个 HTTP 端点）见 [docs/command-reference.md](docs/command-reference.md)；更多安装方式（插件通道 / 一句话让 AI 代装）见[安装与接入](#安装与接入)。
+命令全表（45+ 命令 / 20 个 HTTP 端点）见 [docs/command-reference.md](docs/command-reference.md)；更多安装方式（插件通道 / 一句话让 AI 代装）见[安装与接入](#安装与接入)。
+
+**附着日常浏览器（attach 模式）：**
+
+```bash
+playwright install chromium   # 仅 managed 模式需要；attach 模式复用现有浏览器，无需下载
+browser-agent-client attach --discover                 # 列出本机浏览器与远程调试开关状态
+browser-agent-client attach "$HOME/Library/Application Support/Google/Chrome"
+```
+
+前置：在目标浏览器打开 `chrome://inspect/#remote-debugging` 勾选
+"Allow remote debugging for this browser instance"（可能需重启浏览器）。
 
 ## 核心能力
 
 | 能力 | 说明 |
 | --- | --- |
 | 三层感知降级 | 语义层 → 结构层 → 底层精准操作，失败自动建议降级路径 |
-| 单实例多会话 | 一个 Chromium、N 个隔离 context；命令批串行排队（`BROWSER_AGENT_QUEUE_TIMEOUT` 防无限堆积）；全空闲超时自动关浏览器回收内存 |
+| 单实例多会话·真并行 | 一个浏览器、N 个隔离 context；**跨会话命令批真并行**（contextvar 标签上下文隔离操作目标页），同会话内串行保序（`BROWSER_AGENT_QUEUE_TIMEOUT` 防堆积）；全空闲超时自动回收 |
+| attach 日常浏览器 | CDP 附着用户日常浏览器（任意 Chromium 内核）：登录态免费、指纹真实、自动禁用 stealth；最小侵入契约（永不碰用户标签页 / 不清用户 storage / 不抢焦点）；不扫固定端口、目标不可用硬错不静默换浏览器 |
 | 认证会话 profile | 命名登录态落盘（Playwright storageState + 判定规则三型：`url_pattern` / `js` / `cookie_exists`）；`ensure_auth` 有效即复用、失效即按登录命令序列重登；多账号隔离；凭证只落文件不进日志 |
-| 资源预检 fail-fast | 启动前查内存（宿主与 cgroup v2 取较小者），低于 `BROWSER_AGENT_MIN_FREE_MB` 拒绝拉起，防低配机器被 Chromium 压垮 |
-| AI 友好细节 | 恒返 200 + `ok` 字段、失败自动截图 + possible_cause、导航自动附页面摘要、裁剪截图省 token、stealth 防指纹 |
+| 站点经验积累 | 按域名存储操作经验（平台特征 / 有效模式 / 已知陷阱，带日期）；navigate 自动提示已有经验；`read_site` / `write_site` 命令内闭环；跨会话复用 |
+| 用户数据外置 | profiles / 站点经验 / 状态 / 下载全在 `~/.browser-agent/`，pip 升级重装不丢；旧数据首次运行自动迁移（只复制不覆盖） |
+| 资源预检 fail-fast | 启动前查内存（宿主与 cgroup v2 取较小者），低于 `BROWSER_AGENT_MIN_FREE_MB` 拒绝拉起，防低配机器被 Chromium 压垮（attach 模式跳过） |
+| AI 友好细节 | 恒返 200 + `ok` 字段、失败自动截图 + possible_cause、导航自动附页面摘要 + 站点经验提示、裁剪截图省 token、stealth 防指纹 |
 | 进程清理 | 幂等清理脚本（`browser-agent-cleanup`），pytest conftest / Claude Code Stop hook 三层兜底接入 |
 
 profile 接入两步法与格式定义见 [SKILL.md](SKILL.md)「认证会话管理」。
@@ -123,10 +143,21 @@ pip install git+https://github.com/Howie-Hoo/browser-agent && playwright install
 | --- | --- | --- |
 | `BROWSER_AGENT_MIN_FREE_MB` | 768 | 启动浏览器要求的最低可用内存（MB） |
 | `BROWSER_AGENT_MAX_LOAD` | 不检查 | 1min loadavg 上限，超过拒绝启动 |
-| `BROWSER_AGENT_QUEUE_TIMEOUT` | 600 | 命令批排队等待上限（秒，0 = 不限） |
-| `BROWSER_AGENT_IDLE_SHUTDOWN_SEC` | 900 | 全会话空闲多久自动关浏览器（秒，0 = 禁用） |
+| `BROWSER_AGENT_QUEUE_TIMEOUT` | 600 | 同会话命令批排队等待上限（秒，0 = 不限；跨会话不排队，直接并行） |
+| `BROWSER_AGENT_IDLE_SHUTDOWN_SEC` | 900 | 全会话空闲多久回收（秒，0 = 禁用，改动即时生效）：managed 关浏览器；attach 只关自建标签页、**连接保持**（断连需用户重新授权） |
 | `BROWSER_AGENT_REPORT_DIR` | 仓库 temp/ | 执行报告 / 截图输出目录 |
 | `BROWSER_AGENT_CONFIG` | — | 配置文件路径覆盖 |
+| `BROWSER_AGENT_HOME` | `~/.browser-agent` | 用户数据根目录（profiles / 站点经验 / 状态 / 下载） |
+| `BROWSER_AGENT_MODE` | managed | `attach` 强制附着模式 |
+| `BROWSER_AGENT_ATTACH_DIR` | — | attach：浏览器用户数据目录（覆盖 attach.env 偏好） |
+| `BROWSER_AGENT_CDP_ENDPOINT` | — | attach：显式 CDP 端点（高级） |
+
+## 升级与数据迁移
+
+v2026.11.20 起用户数据（登录态 profile、站点经验、会话状态）全部落在
+`~/.browser-agent/`，pip 升级 / 重装不丢；旧版落在包目录里的数据**首次运行自动迁移**
+（只复制、不覆盖、不删除）。验证步骤与手动迁移命令见
+[docs/migration-2026.11.20.md](docs/migration-2026.11.20.md)。
 
 ## License
 
