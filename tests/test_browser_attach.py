@@ -23,6 +23,13 @@ def home(isolated_home, monkeypatch):
     return isolated_home
 
 
+@pytest.fixture
+def always_listening(monkeypatch):
+    """TCP 探测恒真（用例只关心解析链路，不关心端口是否真的在监听）。"""
+    monkeypatch.setattr(ba, "port_listening",
+                        lambda port, host="127.0.0.1", timeout=1.0: True)
+
+
 def _install_fake_roots(monkeypatch, tmp_path, spec: dict):
     """在 tmp 下伪造若干浏览器并把发现根指过去。spec: {名: 端口或 None}"""
     roots = []
@@ -72,7 +79,7 @@ def test_endpoint_prefers_ws_path_and_falls_back_to_http(tmp_path):
     assert ep2["endpoint"] == "http://127.0.0.1:9444"
 
 
-def test_discover_finds_only_real_browsers(tmp_path):
+def test_discover_finds_only_real_browsers(tmp_path, always_listening):
     _fake_browser(tmp_path, "chrome", port=9333)
     _fake_browser(tmp_path, "edge")            # 未开远程调试
     (tmp_path / "not-a-browser").mkdir()       # 无 Local State，应被忽略
@@ -80,8 +87,20 @@ def test_discover_finds_only_real_browsers(tmp_path):
              ("Ghost", str(tmp_path / "not-a-browser"))]
     found = ba.discover_browsers(roots)
     assert [f["name"] for f in found] == ["Chrome", "Edge"]
-    assert found[0]["remote_debugging"] is True and found[0]["debug_port"] == 9333
-    assert found[1]["remote_debugging"] is False
+    rd = found[0]["remote_debugging"]
+    assert rd["enabled"] is True and rd["port"] == 9333 and rd["detail"] == ""
+    assert rd["endpoint"] == "ws://127.0.0.1:9333/devtools/browser/x"  # 端点随结论给出，无需重读
+    assert found[1]["remote_debugging"]["enabled"] is False
+    assert "DevToolsActivePort" in found[1]["remote_debugging"]["detail"]
+
+
+def test_discover_flags_stale_port_file(tmp_path):
+    """端口文件在但端口不在监听（浏览器崩溃残留）→ 不误报为可附着。"""
+    _fake_browser(tmp_path, "chrome", port=9333)   # 9333 无监听
+    found = ba.discover_browsers([("Chrome", str(tmp_path / "chrome"))])
+    rd = found[0]["remote_debugging"]
+    assert rd["enabled"] is False and rd["port"] == 9333
+    assert "未在监听" in rd["detail"]
 
 
 # ── 端点解析：优先级与硬错 ───────────────────────────────
@@ -92,13 +111,13 @@ def test_explicit_endpoint_wins(home, tmp_path):
     assert res["ok"] and res["endpoint"] == "http://127.0.0.1:9999"
 
 
-def test_configured_dir_resolves_port(home, tmp_path):
+def test_configured_dir_resolves_port(home, tmp_path, always_listening):
     d = _fake_browser(tmp_path, "brave", port=9444)
     res = ba.resolve_endpoint(attach_dir=str(d))
     assert res["ok"] and res["endpoint"] == "ws://127.0.0.1:9444/devtools/browser/x" and res["browser_dir"] == str(d)
 
 
-def test_configured_dir_without_debug_port_hard_errors(home, tmp_path, monkeypatch):
+def test_configured_dir_without_debug_port_hard_errors(home, tmp_path, monkeypatch, always_listening):
     d = _fake_browser(tmp_path, "edge")
     other = _fake_browser(tmp_path, "chrome", port=9333)
     _install_fake_roots(monkeypatch, tmp_path, {"edge": None, "chrome": 9333})
@@ -106,30 +125,51 @@ def test_configured_dir_without_debug_port_hard_errors(home, tmp_path, monkeypat
     # 不静默降级到另一台已开调试的浏览器
     assert res["ok"] is False
     assert "DevToolsActivePort" in res["error"] or "远程调试" in res["error"]
-    assert res["remedy"]
-    assert any(c["dir"] == str(other) for c in res["candidates"])
+    assert res["remedy"] and res["class"] == "unavailable"
+    assert res["reason"] == "not-enabled"
+    assert any(c["data_dir"] == str(other) for c in res["candidates"])
 
 
-def test_invalid_configured_dir_hard_errors(home, tmp_path):
+def test_configured_dir_offline_reports_agent_first_remedy(home, tmp_path, monkeypatch):
+    """端口文件在但不在监听 → offline 分类，remedy 第一步是 agent 代开浏览器。"""
+    d = _fake_browser(tmp_path, "Chrome", port=9333)   # 9333 无监听；目录名可对上启动命令映射
+    monkeypatch.setattr(ba, "port_listening",
+                        lambda port, host="127.0.0.1", timeout=1.0: False)
+    res = ba.resolve_endpoint(attach_dir=str(d))
+    assert res["ok"] is False and res["class"] == "unavailable" and res["reason"] == "offline"
+    assert "代开" in res["remedy"][1] and "chrome" in res["remedy"][1].lower()
+
+
+def test_invalid_configured_dir_is_config_error(home, tmp_path):
     plain = tmp_path / "plain"
     plain.mkdir()
     res = ba.resolve_endpoint(attach_dir=str(plain))
     assert res["ok"] is False and "Local State" in res["error"]
+    assert res["class"] == "config-error"
+    assert any("不需要重启" in step for step in res["remedy"])
 
 
-def test_auto_single_browser(home, tmp_path, monkeypatch):
+def test_invalid_endpoint_format_is_config_error(home):
+    res = ba.resolve_endpoint(cdp_endpoint="not-a-url")
+    assert res["ok"] is False and res["class"] == "config-error"
+
+
+def test_auto_single_browser(home, tmp_path, monkeypatch, always_listening):
     _install_fake_roots(monkeypatch, tmp_path, {"chrome": 9333})
     res = ba.resolve_endpoint()
     assert res["ok"] and res["endpoint"] == "ws://127.0.0.1:9333/devtools/browser/x" and res["source"] == "auto-single"
 
 
-def test_multiple_browsers_without_pref_refuse_to_guess(home, tmp_path, monkeypatch):
+def test_multiple_browsers_without_pref_refuse_to_guess(home, tmp_path, monkeypatch, always_listening):
     _install_fake_roots(monkeypatch, tmp_path, {"chrome": 9333, "edge": 9444})
     res = ba.resolve_endpoint()
     assert res["ok"] is False and "拒绝猜测" in res["error"] and len(res["candidates"]) == 2
+    assert res["class"] == "ambiguous"
+    # remedy 里直接给出可执行的 attach 命令
+    assert any("attach --" in step or "attach \"" in step for step in res["remedy"])
 
 
-def test_preference_roundtrip_and_resolution(home, tmp_path):
+def test_preference_roundtrip_and_resolution(home, tmp_path, always_listening):
     d = _fake_browser(tmp_path, "arc", port=9555)
     ba.save_preference(attach_dir=str(d))
     assert ba.read_preference()["attach_dir"] == str(d)
@@ -243,7 +283,8 @@ def test_probe_reports_listening_port(tmp_path, monkeypatch):
         (data / "DevToolsActivePort").write_text(f"{port}\n/devtools/browser/x\n")
         res = ba.probe_app_data_folder("Chrome")
     b = res["folders"][0]["browsers"][0]
-    assert b["remote_debugging"] == {"enabled": True, "port": port, "detail": ""}
+    assert b["remote_debugging"]["enabled"] is True and b["remote_debugging"]["port"] == port
+    assert b["remote_debugging"]["detail"] == ""
 
 
 def test_probe_rejects_tilde_and_outside(tmp_path, monkeypatch):
@@ -354,3 +395,101 @@ def test_strictly_inside_cross_drive_valueerror(monkeypatch, tmp_path):
         raise ValueError("path is on mount 'D:', start on mount 'C:'")
     monkeypatch.setattr(ba.os.path, "relpath", _raise)
     assert ba._strictly_inside("D:\\x", "C:\\Users") is False
+
+
+# ── 端口文件四分类 / 提示 / 身份归一 ────────────────────────
+
+def test_read_devtools_info_invalid_content(tmp_path):
+    d = _fake_browser(tmp_path, "chrome")
+    (d / "DevToolsActivePort").write_text("not-a-port\n", encoding="ascii")
+    info = ba.read_devtools_info(str(d))
+    assert info["ok"] is False and info["reason"] == "invalid"
+    empty = _fake_browser(tmp_path, "empty")
+    (empty / "DevToolsActivePort").write_text("\n", encoding="ascii")
+    assert ba.read_devtools_info(str(empty))["reason"] == "invalid"
+
+
+def test_read_devtools_info_unreadable_classified(tmp_path, monkeypatch):
+    import builtins
+    real_open = builtins.open
+
+    def _perm_denied(file, *a, **k):
+        if str(file).endswith("DevToolsActivePort"):
+            raise PermissionError(13, "Permission denied")
+        return real_open(file, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", _perm_denied)
+    d = _fake_browser(tmp_path, "chrome", port=9333)
+    info = ba.read_devtools_info(str(d))
+    assert info["ok"] is False and info["reason"] == "unreadable"
+    # unreadable 的 remedy 出路指向显式端点配置
+    remedy = ba._unavailable_remedy("unreadable", info["detail"], "Chrome")
+    assert any("BROWSER_AGENT_CDP_ENDPOINT" in s for s in remedy)
+
+
+def test_launch_hint_per_platform():
+    hint = ba.browser_launch_hint("Chrome")
+    assert hint.startswith("`") and hint.endswith("`")   # 有映射 → 给出可执行命令
+    assert ba.browser_launch_hint("未知浏览器").startswith("用系统方式")
+
+
+def test_discover_payload_has_agent_next_steps(home, monkeypatch, tmp_path, always_listening):
+    _install_fake_roots(monkeypatch, tmp_path, {"chrome": 9333})
+    payload = ba.discover_payload()
+    assert payload["ok"] and len(payload["next_steps"]) == 4
+    assert any("--probe" in s for s in payload["next_steps"])
+
+
+@pytest.mark.skipif(sys.platform != "darwin" and os.name != "nt",
+                    reason="大小写不敏感卷仅 macOS/Windows")
+def test_pin_identity_case_insensitive(tmp_path):
+    """同一浏览器目录大小写写法不同 ≠ 换目标（macOS/Windows 卷不区分大小写）。"""
+    ba.reset_pin()
+    try:
+        d = tmp_path / "ChromeData"
+        d.mkdir()
+        ba.set_pinned_dir(str(d))
+        assert ba.pin_mismatch_error(str(d).swapcase()) is None
+    finally:
+        ba.reset_pin()
+
+
+def test_expand_strips_paired_quotes(home):
+    v = str(home / "Google Chrome")
+    assert ba._expand(f'"{v}"') == ba._expand(v)
+    assert ba._expand(f"'{v}'") == ba._expand(v)
+
+
+def test_discover_enabled_only_when_port_really_listens(tmp_path):
+    """discover 的 TCP 探测真值：端口真实在监听才报 enabled（非 monkeypatch）。"""
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        port = s.getsockname()[1]
+        d = _fake_browser(tmp_path, "Chrome", port=port)
+        found = ba.discover_browsers([("Chrome", str(d))])
+        rd = found[0]["remote_debugging"]
+        assert rd["enabled"] is True and rd["port"] == port and rd["detail"] == ""
+        assert rd["endpoint"].startswith(f"ws://127.0.0.1:{port}")
+
+
+def test_read_devtools_info_non_ascii_is_invalid(tmp_path):
+    """撕裂写残留的非 ASCII 字节 → invalid 分类，不裸抛（旧码只捕 OSError）。"""
+    d = _fake_browser(tmp_path, "chrome")
+    (d / "DevToolsActivePort").write_bytes(b"\xff\xfe\x80bad\n")
+    info = ba.read_devtools_info(str(d))
+    assert info["ok"] is False and info["reason"] == "invalid"
+
+
+def test_discover_stale_port_reports_offline_reason(tmp_path):
+    """端口文件在但不在监听 → remote_debugging 带 reason=offline（auto 解析据此分诊）。"""
+    _fake_browser(tmp_path, "Chrome", port=9333)
+    found = ba.discover_browsers([("Chrome", str(tmp_path / "Chrome"))])
+    assert found[0]["remote_debugging"]["reason"] == "offline"
+
+
+def test_error_response_requires_klass():
+    """klass 是必填关键字：漏传是 TypeError（编译期失败），不再是静默误分类。"""
+    with pytest.raises(TypeError):
+        ba.error_response("x", ["c"])

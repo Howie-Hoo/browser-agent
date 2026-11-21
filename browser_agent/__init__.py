@@ -1,5 +1,9 @@
 """browser-agent：给 AI 代理用的本地浏览器操作微服务（Playwright）。"""
-__version__ = "2026.11.21"
+__version__ = "2026.11.21.1"
+
+# 服务身份名：server 写进 /status 与 pid 文件，client/cleanup 据此核对——
+# 三方共用一个声明，改名不会出现某方核对恒失败的漂移
+SERVICE_NAME = "browser_agent"
 
 # 惰性导出：client/server 顶层缺依赖时会 sys.exit(1)，急切导入会让
 # `import browser_agent` 在未装依赖的环境里直接崩溃

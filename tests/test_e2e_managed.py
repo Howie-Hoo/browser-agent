@@ -623,7 +623,7 @@ def test_shutdown_drains_inflight_batch(pages):
         ], sid="drain-1")
     t = threading.Thread(target=_batch); t.start()
     import time as _t; _t.sleep(0.8)
-    s.post("/shutdown", {})
+    s.post("/shutdown", {"instance_id": s.get("/status")["instance_id"]})
     t.join(timeout=30)
     assert result.get("r", {}).get("ok") is True, f"在途批被关停腰斩: {result}"
     try:

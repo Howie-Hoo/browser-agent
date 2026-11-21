@@ -22,6 +22,12 @@ CLI（pip 安装后为 browser-agent-client；未安装用 python -m browser_age
   browser-agent-client attach --forget     清除附着偏好
   browser-agent-client shutdown
 
+退出码（agent 可据此分支，不必解析输出文本）：
+  0  成功
+  1  硬失败（服务未起 / 命令批失败 / 参数错误）
+  2  需要用户动作——服务已在但浏览器未连上（attach 等待授权弹窗、目标浏览器
+     未开/未开调试开关）；处理完用户侧重试即可
+
 Python API：
   from browser_agent.client import BrowserAgentClient
   client = BrowserAgentClient(port=7788, base_url="http://localhost:3000")
@@ -37,11 +43,19 @@ import uuid
 import subprocess
 from typing import Optional, Union
 
+from . import SERVICE_NAME as _SERVICE_NAME
+from .utils import SERVER_DRAIN_SEC, is_pid_alive
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
-_SERVICE_NAME = "browser_agent"
+
+
+def _attach_pending(status: Optional[dict]) -> bool:
+    """「attach 且浏览器未连上」谓词——/status 字段知识的单点（三个调用方共用）。"""
+    return bool(status and status.get("browser_mode") == "attach"
+                and not status.get("browser_active"))
 
 
 def _server_env() -> dict:
@@ -80,24 +94,6 @@ def _read_pid() -> Optional[dict]:
             return json.load(f)
     except Exception:
         return None
-
-
-def _is_pid_alive(pid: int) -> bool:
-    try:
-        if sys.platform == "win32":
-            import ctypes
-            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
-            if not handle:
-                return False
-            code = ctypes.c_ulong()
-            ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
-            ctypes.windll.kernel32.CloseHandle(handle)
-            return code.value == 259
-        else:
-            os.kill(pid, 0)
-            return True
-    except Exception:
-        return False
 
 
 # ─────────────────────────────────────────────────────────
@@ -154,8 +150,14 @@ class BrowserAgentClient:
     # ── 启动 ──────────────────────────────────────────────
 
     def start_service(self) -> bool:
-        if self.is_running():
+        # 单次拉取：is_running 语义（服务身份核对）内联展开，避免同路径打两次 GET
+        s = self.get_status()
+        if s is not None and s.get("service") == _SERVICE_NAME:
             _log("服务已在运行")
+            # attach 且浏览器未连上（典型：上次在等授权点了超时）→ 补就绪等待，
+            # 维持「退出码 0 = 浏览器真可用」的契约，不让重试 start 假成功
+            if _attach_pending(s):
+                return self._await_attach_ready()
             return True
 
         # 已保存附着偏好 → 以 attach 模式启动（附着用户日常浏览器，登录态免费）
@@ -189,14 +191,17 @@ class BrowserAgentClient:
         if self.headless:
             cmd.append("--headless")
 
+        # 独立进程组/会话：服务与启动它的终端解耦（关终端/退出 agent 会话不带走
+        # 共享服务），也让「精确清理整棵进程树」（server → playwright driver →
+        # Chromium）成为可能——服务日志由自身写入 ~/.browser-agent/logs/，不依赖 stdout
         kwargs = {}
         if sys.platform == "win32":
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            kwargs["stdout"] = subprocess.DEVNULL
-            kwargs["stderr"] = subprocess.DEVNULL
+            kwargs["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP
+                                       | subprocess.DETACHED_PROCESS)
         else:
-            kwargs["stdout"] = subprocess.DEVNULL
-            kwargs["stderr"] = subprocess.DEVNULL
+            kwargs["start_new_session"] = True
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
 
         subprocess.Popen(cmd, env=_server_env(), **kwargs)
 
@@ -204,8 +209,57 @@ class BrowserAgentClient:
             time.sleep(0.5)
             if self.is_running():
                 _log(f"服务就绪 ✓ ({(i+1)*0.5:.1f}s)")
+                if attach_args:
+                    # attach 的就绪 = 浏览器真连上（授权点过/目标可用），不是 HTTP 起来
+                    return self._await_attach_ready()
                 return True
         _err("服务启动超时（30s）")
+        from . import logs
+        _err(f"服务日志: {logs.log_path()}（启动/连接失败原因见此文件）")
+        return False
+
+    def _await_attach_ready(self) -> bool:
+        """attach 模式等浏览器真正连上（lazy 连接经 session/start 触发）。
+
+        新式开关下每条新连接都要用户在浏览器点「允许」：2s 未连上即打印授权
+        提示（不让 agent 与用户盲等），窗口 BROWSER_AGENT_ATTACH_READY_SEC
+        （默认 20s）。超时**不杀服务**（用户点完允许后下一个请求即连上），
+        返回 False 由 CLI 以退出码 2 告知「需要用户动作」。
+        """
+        try:
+            ready_sec = float(os.getenv("BROWSER_AGENT_ATTACH_READY_SEC", "20"))
+        except ValueError:
+            ready_sec = 20.0
+        # 触发连接：default 会话的建立即发起 CDP 附着（最长 120s 授权窗口在服务侧）
+        try:
+            self._http.post(f"{self._base}/session/start",
+                            json={"session_id": "default", "context": "user"},
+                            timeout=5)
+        except Exception:
+            pass
+        hint_shown = False
+        deadline = time.monotonic() + max(1.0, ready_sec)
+        while time.monotonic() < deadline:
+            s = self.get_status()
+            if s and s.get("browser_active"):
+                _log("浏览器已附着 ✓（登录态可用）")
+                return True
+            if not hint_shown:
+                # 消费 /status 的 browser_starting：连接尝试中 ≈ 授权弹窗待点；
+                # 否则大概率是目标浏览器没开/开关没开——两种提示动作不同
+                if s and s.get("browser_starting"):
+                    _log("⚠️ 正在连接浏览器——若出现远程调试授权弹窗，请点击「允许」，"
+                         "连接会随后自动完成")
+                else:
+                    _log("⚠️ 浏览器尚未连上——若浏览器出现授权弹窗请点击「允许」；"
+                         "没有弹窗则检查目标浏览器是否在运行、调试开关是否开启")
+                hint_shown = True
+            time.sleep(0.5)
+        _err(f"浏览器在 {ready_sec:.0f}s 内未连上（等待授权/目标浏览器不可用）。"
+             "服务保持运行：完成授权或打开目标浏览器后，下一个请求会自动重试")
+        from . import logs
+        _err(f"排障: browser-agent-client attach --discover 查看状态；"
+             f"服务日志 {logs.log_path()}")
         return False
 
     def ensure_service_running(self) -> bool:
@@ -220,7 +274,7 @@ class BrowserAgentClient:
 
         pid_info = _read_pid()
         if pid_info and pid_info.get("port") == self.port:
-            if _is_pid_alive(pid_info["pid"]):
+            if is_pid_alive(pid_info["pid"]):
                 # 测试模式下不再试图自杀重启
                 pass
 
@@ -401,16 +455,12 @@ class BrowserAgentClient:
         if target:
             is_endpoint = "://" in target
             if not is_endpoint:
-                try:
-                    target = browser_attach.expand_path(target)
-                except ValueError as e:
-                    _err(f"附着目录路径无效: {e}")
+                # 目录校验/报错走 browser_attach 单点（与 POST /attach/select 同源）
+                res = browser_attach.validate_attach_dir(target)
+                if not res.get("ok"):
+                    _err(browser_attach.format_attach_error(res))
                     return False
-                if not browser_attach.is_browser_data_dir(target):
-                    _err(browser_attach.format_attach_error(browser_attach.error_response(
-                        f"目录不是浏览器数据目录（缺少 Local State）: {target}",
-                        candidates=browser_attach.discover_browsers())))
-                    return False
+                target = res["dir"]
             browser_attach.save_preference(
                 attach_dir="" if is_endpoint else target,
                 cdp_endpoint=target if is_endpoint else "",
@@ -420,13 +470,20 @@ class BrowserAgentClient:
         return self.restart_service()
 
     def shutdown(self) -> bool:
-        """优雅关闭服务（浏览器 + HTTP 服务）。"""
-        if not self.is_running():
+        """优雅关闭服务（浏览器 + HTTP 服务）。
+
+        关停是实例身份门控的维护操作：先 GET /status 取当前 instance_id，
+        再随关停请求提交——服务被替换过（旧 id 失配）会得到 409 而不是误杀新实例。
+        """
+        status = self.get_status()
+        if status is None:
             _log("服务未运行")
             return True
         _log("关闭服务...")
         try:
-            r = self._http.post(f"{self._base}/shutdown", json={}, timeout=15)
+            r = self._http.post(f"{self._base}/shutdown",
+                                json={"instance_id": status.get("instance_id", "")},
+                                timeout=15)
             return r.json().get("ok", False)
         except Exception:
             return False
@@ -436,13 +493,10 @@ class BrowserAgentClient:
         if not self.is_running():
             return self.start_service()
         _log("重启服务...")
-        try:
-            self._http.post(f"{self._base}/shutdown", json={}, timeout=15)
-        except Exception:
-            pass
+        self.shutdown()
         # 等旧实例真正退出再启动：排水期间 /status 仍应答（维护态设计），
         # 固定 sleep 会把排水中的旧服务误判为「已在运行」→ 假成功、后继无人
-        deadline = time.time() + 25  # 排水上限 10s + 浏览器关闭余量
+        deadline = time.time() + SERVER_DRAIN_SEC + 15  # 服务排水上限 + 浏览器关闭余量
         while time.time() < deadline:
             if self.get_status() is None:
                 break
@@ -540,6 +594,12 @@ def _print_find_url(result: dict, sort: str = "recent") -> None:
         print("（无匹配结果）")
 
 
+def _needs_user_action(client: "BrowserAgentClient") -> bool:
+    """服务已在但浏览器未连上（attach 等授权/目标浏览器不可用）→ 退出码 2。"""
+    s = client.get_status()
+    return bool(s and s.get("service") == _SERVICE_NAME and _attach_pending(s))
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -561,7 +621,9 @@ def main():
                 sys.exit(1)
 
         elif sub == "start":
-            sys.exit(0 if client.start_service() else 1)
+            if client.start_service():
+                sys.exit(0)
+            sys.exit(2 if _needs_user_action(client) else 1)
 
         elif sub == "run":
             if not pos:
@@ -631,7 +693,9 @@ def main():
                 _log("附着偏好已清除（下次 start 回到 managed 模式）")
                 sys.exit(0)
             target = pos[0] if pos else ""
-            sys.exit(0 if client.attach(target) else 1)
+            if client.attach(target):
+                sys.exit(0)
+            sys.exit(2 if _needs_user_action(client) else 1)
 
         else:
             _err(f"未知子命令: {sub}")

@@ -445,18 +445,33 @@ def test_close_user_session_closes_own_pages_only():
 # ── 关停维护态（排水拒绝新批）──────────────────────────────
 
 class _FakeReq:
-    has_body = False
     path = "/run"
     method = "POST"
 
+    def __init__(self, body=None):
+        self._body = body
+        self.can_read_body = body is not None
+
     async def json(self):
-        return {}
+        return self._body or {}
+
+
+def test_shutdown_requires_matching_instance_id(monkeypatch):
+    """实例身份门：不带/带错 instance_id → 409 拒绝且不进维护态。"""
+    s = AppState()
+    monkeypatch.setattr(browser_server, "_state", s)
+    resp = asyncio.run(browser_server.handle_shutdown(_FakeReq({})))
+    body = json.loads(resp.text)
+    assert body["ok"] is False and resp.status == 409
+    assert body["instance_id"] == browser_server._INSTANCE_ID
+    assert s.maintenance is False
 
 
 def test_shutdown_sets_maintenance_flag(monkeypatch):
     s = AppState()
     monkeypatch.setattr(browser_server, "_state", s)
-    resp = asyncio.run(browser_server.handle_shutdown(_FakeReq()))
+    resp = asyncio.run(browser_server.handle_shutdown(
+        _FakeReq({"instance_id": browser_server._INSTANCE_ID})))
     body = json.loads(resp.text)
     assert body["ok"] is True
     assert s.maintenance is True

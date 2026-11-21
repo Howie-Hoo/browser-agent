@@ -76,7 +76,7 @@ with BrowserAgentClient(base_url="http://localhost:3000") as client:
 
 **CLI:** `status | start | run <json> | check <type> | reset | stop-session | sites [domain] | find-url [keywords…] | attach <dir|--discover|--probe folder|--forget> | shutdown`
 
-Full command reference (45+ commands / 20 HTTP endpoints): [docs/command-reference.md](docs/command-reference.md). More install options (plugin channel, one line to your AI) under [Install](#install).
+Full command reference (47+ commands / 20 HTTP endpoints): [docs/command-reference.md](docs/command-reference.md). More install options (plugin channel, one line to your AI) under [Install](#install).
 
 **Attach your daily browser (attach mode):**
 
@@ -110,7 +110,9 @@ browser-agent-client find-url --since 7d --sort visits # most-visited sites this
 | User data out of the package | Profiles / site experience / state / downloads all live in `~/.browser-agent` — pip upgrades never wipe them; legacy in-package data migrates automatically on first run (copy-only, never overwrites) |
 | Resource preflight | Memory check (min of host and cgroup v2) before launch; refuses below `BROWSER_AGENT_MIN_FREE_MB` to protect low-spec machines (skipped in attach mode) |
 | AI-friendly details | Always HTTP 200 with an `ok` field, automatic failure screenshots + possible_cause, page summary + site-experience hints attached to navigations, clip screenshots to save tokens, stealth fingerprint evasion |
-| Process cleanup | Idempotent cleanup script (`browser-agent-cleanup`); three-layer safety net via pytest conftest / Claude Code Stop hooks |
+| Process cleanup | `browser-agent-cleanup` precisely reclaims **this service's own process tree** (triple identity check: pid file → HTTP identity → cmdline; graceful shutdown → SIGTERM → SIGKILL), cross-platform, never pattern-kills processes by name |
+| HTTP source guard | Beyond binding 127.0.0.1: loopback Host allowlist, reject any request carrying a browser Origin, and require application/json for bodies — no web page can cross-site drive the local service (CSRF / DNS-rebinding defense) |
+| Full lifecycle logging | `~/.browser-agent/logs/server.log` (2MB×7 rotating): startup / browser connection / sessions / command batches / idle recycling / shutdown / guard rejections |
 
 Profile format and the two-step integration are documented in [SKILL.md](SKILL.md) (in Chinese).
 

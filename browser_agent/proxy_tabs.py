@@ -348,6 +348,38 @@ class BrowserProxyTabs:
         return res
 
     # ── iframe 切换 ──────────────────────────────────────────
+    async def list_frames(self) -> dict:
+        """列出主文档**直系** iframe（文档顺序，带 index/id/name/src，便于指认）。
+
+        与 switch_frame 失败时的全量回显互补：这里只列一层、只读不切状态，
+        认出目标后再 switch_frame(selector/name/url_contains) 进入；嵌套 iframe
+        先进入外层，再次 list_frames 即见下一层。
+        """
+        page = self._main_page
+        if page is None:
+            return {"ok": False, "error": "无可用页面"}
+        main = page.main_frame
+        frames = []
+        for i, f in enumerate(fr for fr in page.frames if fr.parent_frame is main):
+            entry = {"index": i, "name": f.name or "", "url": f.url}
+            try:
+                el = await f.frame_element()
+                for attr in ("id", "name", "src"):
+                    v = await el.get_attribute(attr)
+                    if v:
+                        entry[attr] = v
+            except Exception:
+                pass  # 跨进程/已导航中的 frame 可能拿不到元素属性——基础字段照给
+            frames.append(entry)
+        cur = self._frames.get(self._tab())
+        res = {"ok": True, "frames": frames, "count": len(frames),
+               "in_frame": cur is not None}
+        if cur is not None:
+            res["current_frame_url"] = cur.url
+        if not frames:
+            res["ai_hint"] = "主文档没有直接 iframe"
+        return res
+
     async def switch_frame(self, selector: str = None, name: str = None, url_contains: str = None) -> dict:
         """
         切换到指定 iframe/frame 上下文。切换后所有 click/fill 等操作均在该 frame 内执行。

@@ -22,6 +22,17 @@ from datetime import datetime
 from .utils import log
 
 MIGRATED_MARKER = ".migrated"
+PID_FILE_NAME = "browser_agent.pid"
+
+
+def home_root() -> str:
+    """用户数据根路径（纯计算、无副作用——不建目录、不触发迁移）。
+
+    logs.log_path / cleanup._pid_file 等不得带副作用的位置统一从这里取路径；
+    需要确保存在/迁移时才走 data_dir()。
+    """
+    return os.getenv("BROWSER_AGENT_HOME") or os.path.join(
+        os.path.expanduser("~"), ".browser-agent")
 
 # 旧版数据位置（包目录内 / 仓库根 storage/）——只作一次性迁移来源
 _LEGACY_PKG_STORAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage")
@@ -35,9 +46,7 @@ _legacy_pid_checked = False
 
 def data_dir() -> str:
     """用户数据根目录（确保存在 + 一次性迁移已执行）。"""
-    root = os.getenv("BROWSER_AGENT_HOME") or os.path.join(
-        os.path.expanduser("~"), ".browser-agent"
-    )
+    root = home_root()
     _ensure(root)
     return root
 
@@ -62,7 +71,7 @@ def pid_file() -> str:
     """服务 pid 文件（运行态与用户数据同落 ~/.browser-agent/——永不写包目录，
     pip 重装不留 stale pid）。惰性语义由 data_dir() 保证：只在调用时解析，
     import 期不触碰用户目录（测试的 BROWSER_AGENT_HOME 隔离晚于模块导入）。"""
-    return os.path.join(data_dir(), "browser_agent.pid")
+    return os.path.join(data_dir(), PID_FILE_NAME)
 
 
 def cookies_file() -> str:

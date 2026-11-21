@@ -28,8 +28,5 @@ browser-agent-cleanup = "browser_agent.cleanup:main"
 [tool.setuptools]
 packages = ["browser_agent"]
 
-[tool.setuptools.package-data]
-browser_agent = ["cleanup.sh"]
-
 [tool.setuptools.dynamic]
 version = { attr = "browser_agent.__version__" }

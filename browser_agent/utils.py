@@ -10,12 +10,16 @@ import json
 import os
 import sys
 
+from . import logs
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 
 def log(msg: str):
     print(f"[代理] {msg}", flush=True)
+    # 生命周期日志（服务进程 activate 后落文件；client 进程为 no-op）
+    logs.log(msg)
 
 
 def emit(data: dict):
@@ -127,6 +131,35 @@ def read_json(path: str, default=None):
     except (OSError, ValueError):
         return default
     return data if isinstance(data, dict) else default
+
+
+# 服务端关停排水上限（server._do_shutdown 消费；client 重启等待窗与 cleanup
+# 优雅关停等待窗按它推导——改这里，三处同步，杜绝"魔法余量"各自漂移）
+SERVER_DRAIN_SEC = 10
+
+
+def is_pid_alive(pid: int) -> bool:
+    """跨平台进程存活探测。
+
+    Windows 下 `os.kill(pid, 0)` 并非无副作用探测——signal 0 即 CTRL_C_EVENT，
+    走 GenerateConsoleCtrlEvent 路径：对无控制台的进程失败（误判已退出），
+    对共享控制台组的不相关进程则真的送达一次 Ctrl+C。必须走
+    OpenProcess / GetExitCodeProcess（client 与 cleanup 共用本实现）。
+    """
+    try:
+        if os.name == "nt":
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return False
+            code = ctypes.c_ulong()
+            ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return code.value == 259  # STILL_ACTIVE
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def report_dir() -> str:

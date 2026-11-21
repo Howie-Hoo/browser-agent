@@ -142,7 +142,7 @@ def test_maintenance_rejects_new_batches_during_drain(pages):
         assert wait_active_batches(lambda: s.get("/status"), 1,
                                    timeout=8) >= 1, "长批应进入执行"
 
-        sh = s.post("/shutdown")
+        sh = s.post("/shutdown", {"instance_id": s.get("/status")["instance_id"]})
         assert sh["ok"] and sh.get("instance_id")
 
         # 排水必然进行中（长批未结束）→ 新批被拒

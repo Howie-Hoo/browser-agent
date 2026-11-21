@@ -164,3 +164,40 @@ def test_mixin_wrappers_delegate(tmp_path, monkeypatch):
     assert listed["count"] == 1
     assert asyncio.run(proxy.delete_site("m.com"))["ok"] is True
     assert asyncio.run(proxy.read_site(None))["ok"] is False
+
+
+# ── 自由文本匹配（用户说法 → 经验前置到选入口之前）──────────
+
+def test_match_free_text_via_alias(store):
+    sp.write_pattern("xiaohongshu.com", aliases=["小红书"],
+                     patterns=["笔记直链必须带 xsec_token，从搜索进"])
+    res = sp.match_site("去小红书搜穿搭")
+    assert res["matched"] and res["match_type"] == "text"
+    assert res["domain"] == "xiaohongshu.com"
+    assert "xsec_token" in res["content"]
+
+
+def test_match_free_text_via_domain_substring(store):
+    sp.write_pattern("portal.internal.corp", aliases=["财务平台"], patterns=["p"])
+    res = sp.match_site("帮我在财务平台查下报销")
+    assert res["matched"] and res["domain"] == "portal.internal.corp"
+
+
+def test_valid_domain_input_not_confused_by_text_fallback(store):
+    """合法域名入参走精确/子域/别名匹配，不进自由文本回退。"""
+    sp.write_pattern("example.com", aliases=["示例站"], patterns=["p"])
+    res = sp.match_site("example.com")
+    assert res["matched"] and res["match_type"] == "exact"
+
+
+def test_free_text_no_hit_returns_known_domains(store):
+    sp.write_pattern("example.com", patterns=["p"])
+    res = sp.match_site("随便聊聊今天天气")
+    assert res["matched"] is False and res["known_domains"] == ["example.com"]
+
+
+def test_free_text_domain_match_requires_boundary(store):
+    """域名子串匹配要边界：a.co 不得命中 xa.co.cn 这类假阳性。"""
+    sp.write_pattern("a.co", patterns=["p"])
+    assert sp.match_site("看看 xa.co.cn 的新功能")["matched"] is False
+    assert sp.match_site("去 a.co 看看")["matched"] is True

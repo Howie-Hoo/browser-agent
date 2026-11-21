@@ -81,3 +81,98 @@ def test_find_url_bad_limit_isolated(monkeypatch):
     assert res["ok"] is False and "--limit" in res["error"]
     res2 = c.find_url(["x"], limit="0")
     assert res2["ok"] is False and "未找到任何可辨认" in res2["error"]
+
+
+# ── 退出码契约（0 成功 / 1 硬失败 / 2 需用户动作）──────────
+
+class _StubClient:
+    """CLI 层测试替身：只提供 main() 用到的表面（start_service/get_status）。"""
+
+    def __init__(self, status=None):
+        self._status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def start_service(self):
+        return False
+
+    def get_status(self):
+        return self._status
+
+
+def test_exit_code_2_when_attach_browser_not_connected(monkeypatch, capsys):
+    """服务在但 attach 浏览器未连上（等授权/目标不可用）→ CLI 退出码 2。"""
+    from browser_agent import client as cli
+
+    monkeypatch.setattr(cli, "BrowserAgentClient", lambda **kw: _StubClient(
+        status={"service": "browser_agent", "browser_mode": "attach",
+                "browser_active": False}))
+    with pytest.raises(SystemExit) as e:
+        _run_main(cli, ["start"])
+    assert e.value.code == 2
+
+
+def _run_main(cli, argv):
+    import sys as _sys
+    old = _sys.argv
+    _sys.argv = ["browser-agent-client"] + argv
+    try:
+        return cli.main()
+    finally:
+        _sys.argv = old
+
+
+def test_exit_code_1_on_plain_failure(monkeypatch):
+    from browser_agent import client as cli
+
+    monkeypatch.setattr(cli, "BrowserAgentClient", lambda **kw: _StubClient(status=None))
+    with pytest.raises(SystemExit) as e:
+        _run_main(cli, ["start"])
+    assert e.value.code == 1
+
+
+# ── attach 就绪等待（授权提示 + 超时返回 False）────────────
+
+def test_await_attach_ready_success_then_timeout(monkeypatch, isolated_home):
+    from types import SimpleNamespace
+    from browser_agent.client import BrowserAgentClient
+
+    monkeypatch.setenv("BROWSER_AGENT_ATTACH_READY_SEC", "1")
+    monkeypatch.setattr("time.sleep", lambda s: None)  # 纯逻辑测试不吃真实等待
+    c = BrowserAgentClient.__new__(BrowserAgentClient)
+    c._http = SimpleNamespace(post=lambda *a, **k: None)
+
+    seq = [{"browser_active": False}, {"browser_active": True}]
+    monkeypatch.setattr(c, "get_status",
+                        lambda: seq.pop(0) if seq else {"browser_active": True})
+    assert c._await_attach_ready() is True
+
+    seq2 = [{"browser_active": False}] * 50
+    monkeypatch.setattr(c, "get_status",
+                        lambda: seq2.pop(0) if seq2 else {"browser_active": False})
+    assert c._await_attach_ready() is False
+
+
+def test_start_service_waits_when_attach_not_connected(monkeypatch):
+    """服务已在但 attach 未连上：start 补就绪等待（退出码契约），不假成功。"""
+    from types import SimpleNamespace
+    from browser_agent.client import BrowserAgentClient
+
+    c = BrowserAgentClient.__new__(BrowserAgentClient)
+    c._http = SimpleNamespace(post=lambda *a, **k: None)
+    monkeypatch.setattr(c, "is_running", lambda: True)
+    waited = []
+    monkeypatch.setattr(c, "_await_attach_ready", lambda: waited.append(1) or True)
+
+    monkeypatch.setattr(c, "get_status",
+                        lambda: {"service": "browser_agent", "browser_mode": "attach", "browser_active": False})
+    assert c.start_service() is True and waited == [1]
+
+    monkeypatch.setattr(c, "get_status",
+                        lambda: {"service": "browser_agent", "browser_mode": "managed", "browser_active": True})
+    waited.clear()
+    assert c.start_service() is True and waited == []

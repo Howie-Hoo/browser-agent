@@ -333,7 +333,10 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth,
         from .browser_attach import (resolve_endpoint, format_attach_error,
                                      attach_identity, pin_mismatch_error,
                                      endpoint_port)
-        info = resolve_endpoint(self.attach_dir, self.cdp_endpoint)
+        # 解析含同步文件 IO + TCP 探测（失败路径还会全盘重扫发现根，最坏秒级）：
+        # 下线程执行，不阻塞事件循环上其他会话的批与 /status 轮询
+        info = await asyncio.to_thread(resolve_endpoint,
+                                       self.attach_dir, self.cdp_endpoint)
         if not info.get("ok"):
             raise RuntimeError(format_attach_error(info))
         # 进程级身份 pin：本进程已附着过别的浏览器/端点 → 硬错（不静默换目标）。
@@ -469,22 +472,49 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth,
         selector: Optional[str] = None,
         clip: Optional[dict] = None,
         return_base64: bool = False,
+        image_type: Optional[str] = None,
+        quality: int = 80,
+        scale: Optional[str] = None,
     ) -> dict:
+        """截图。省 token 优先级：clip/selector（元素）> viewport > full_page；
+        内容型页面 image_type="jpeg"（quality 默认 80）通常比 PNG 小 3~5 倍；
+        scale="css" 按页面 CSS 像素出图（devicePixelRatio>1 的机器上更小）。
+
+        image_type 缺省时按 path 后缀推断（.jpg/.jpeg → jpeg，其余 png）；
+        显式指定且与后缀不符时改写后缀以匹配实际格式（返回的 path 是最终路径）。
+        """
+        if image_type not in (None, "png", "jpeg"):
+            return {"ok": False, "error": "image_type 仅支持 png | jpeg"}
+        if image_type is None:
+            ext = os.path.splitext(path or "")[1].lower()
+            image_type = "jpeg" if ext in (".jpg", ".jpeg") else "png"
         if path:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            if not path.lower().endswith(f".{image_type}"):
+                path = f"{path.rsplit('.', 1)[0] if '.' in os.path.basename(path) else path}.{image_type}"
+
+        # type/quality 规则单点构造（元素与页面两条分支共用）
+        kwargs = {"type": image_type}
+        if image_type == "jpeg":
+            kwargs["quality"] = quality
 
         if selector:
             el = await self._page.wait_for_selector(selector)
             if path:
-                await el.screenshot(path=path)
+                await el.screenshot(path=path, **kwargs)
                 emit({"type": "screenshot", "path": path, "selector": selector})
                 return {"path": path}
-            data = await el.screenshot()
+            data = await el.screenshot(**kwargs)
             b64 = base64.b64encode(data).decode()
             emit({"type": "screenshot", "base64": b64, "selector": selector})
             return {"base64": b64}
 
-        kwargs = {"clip": clip} if clip else {"full_page": full_page}
+        if clip:
+            kwargs["clip"] = clip
+        else:
+            kwargs["full_page"] = full_page
+        if scale in ("css", "device"):
+            kwargs["scale"] = scale
         if path:
             await self._page.screenshot(path=path, **kwargs)
             log(f"截图: {path}")
@@ -584,11 +614,71 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth,
 
     # ── JavaScript ────────────────────────────────────────
 
-    async def eval_js(self, script: str, selector: Optional[str] = None) -> dict:
+    async def eval_js(self, script: str, selector: Optional[str] = None,
+                      isolated: bool = False) -> dict:
+        """执行 JS 表达式（底层万能工具）。
+
+        isolated=True：在主文档的**隔离环境**（isolated world）执行——页面脚本
+        对 document.querySelectorAll / elementFromPoint 等 DOM API 的改写不影响
+        结果，反自动化页面也拿不到干净 DOM 视图。代价：看不到页面自己的 JS
+        全局变量（window.__APP__ 之类）；隔离求值只作用于主文档，当前若已
+        switch_frame 进 iframe，请用默认模式或先 switch_to_main_frame。
+        """
+        if isolated:
+            if selector:
+                return {"ok": False,
+                        "error": "isolated 求值不支持 selector（隔离环境作用于主文档全局，"
+                                 "拿不到元素作用域）。元素级求值请去掉 isolated，"
+                                 "或在 script 内自行 querySelector"}
+            return await self._eval_js_isolated(script)
         if selector:
             value = await self._page.locator(selector).first.evaluate(script)
         else:
             value = await self._page.evaluate(script)
+        return self._wrap_eval_value(value)
+
+    async def _eval_js_isolated(self, script: str) -> dict:
+        """经 CDP 在主文档隔离环境求值（每次独立建/撤会话，无共享状态）。"""
+        page = self._main_page
+        if page is None:
+            return {"ok": False, "error": "无可用页面"}
+        try:
+            session = await page.context.new_cdp_session(page)
+        except Exception as e:
+            return {"ok": False,
+                    "error": f"隔离环境需要 CDP 会话（仅 Chromium）：{str(e).splitlines()[0]}"}
+        try:
+            tree = await session.send("Page.getFrameTree")
+            frame_id = tree["frameTree"]["frame"]["id"]
+            world = await session.send("Page.createIsolatedWorld",
+                                       {"frameId": frame_id,
+                                        "worldName": "browser-agent-isolated"})
+            ctx_id = world.get("executionContextId")
+            if not ctx_id:
+                return {"ok": False, "error": "隔离执行环境创建失败"}
+            resp = await session.send("Runtime.evaluate", {
+                "expression": script, "returnByValue": True,
+                "awaitPromise": True, "contextId": ctx_id})
+        except Exception as e:
+            return {"ok": False, "error": f"隔离求值失败: {str(e).splitlines()[0]}"}
+        finally:
+            try:
+                await session.detach()
+            except Exception:
+                pass
+        if resp.get("exceptionDetails"):
+            text = (resp["exceptionDetails"].get("exception", {}).get("description")
+                    or resp["exceptionDetails"].get("text", "JS 执行异常"))
+            return {"ok": False, "error": text.splitlines()[0]}
+        # 隔离环境结果没有 Python 侧对象，只有 CDP RemoteObject 描述
+        result = resp.get("result", {})
+        value = result.get("value")
+        value_type = result.get("type", "undefined")
+        emit({"type": "eval_js", "isolated": True, "value": value, "value_type": value_type})
+        return {"value": value, "raw_value": value, "value_type": value_type}
+
+    @staticmethod
+    def _wrap_eval_value(value) -> dict:
         # O6: 类型保留
         if isinstance(value, bool):
             value_type = "boolean"
@@ -624,6 +714,23 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth,
         emit({"type": "reload", "ok": True})
         return {"ok": True}
 
+    async def go_back(self, wait_until: str = "load") -> dict:
+        """后退一页（无历史时不报错，went_back=false 如实回报）。
+
+        导航是页级操作：当前在 iframe 上下文时也作用于主文档（Frame 没有
+        go_back），且导航后原 iframe 上下文必然失效——顺带退出 frame 上下文。
+        """
+        page = self._main_page
+        if page is None:
+            return {"ok": False, "error": "无可用页面"}
+        resp = await page.go_back(wait_until=wait_until)
+        self._frames.pop(self._tab(), None)
+        went = resp is not None
+        emit({"type": "go_back", "went_back": went, "ok": True})
+        if went:
+            return {"ok": True, "went_back": True, "url": page.url}
+        return {"ok": True, "went_back": False, "note": "没有可后退的历史"}
+
     # ── 命令分发 ──────────────────────────────────────────
 
     # 注册/查找标签页的命令及其键参数——命名空间化的唯一事实来源（server 不再维护清单）
@@ -650,7 +757,8 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth,
         handlers = {
             "navigate":          lambda: self.navigate(p.get("url"), p.get("wait_until", "networkidle")),
             "screenshot":        lambda: self.screenshot(p.get("path"), p.get("full_page", True),
-                                                         p.get("selector"), p.get("clip"), p.get("return_base64", False)),
+                                                         p.get("selector"), p.get("clip"), p.get("return_base64", False),
+                                                         p.get("image_type", "png"), p.get("quality", 80), p.get("scale")),
             "click":             lambda: self.click(p["selector"], p.get("button", "left"),
                                                     p.get("click_count", 1), p.get("delay", 0), p.get("position")),
             "click_xy":          lambda: self.click_xy(p["x"], p["y"], p.get("button", "left"),
@@ -664,7 +772,7 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth,
             "select":            lambda: self.select_option(p["selector"], p.get("value"), p.get("label"), p.get("index")),
             "check":             lambda: self.check(p["selector"], p.get("force", False)),
             "uncheck":           lambda: self.uncheck(p["selector"]),
-            "upload_file":       lambda: self.upload_file(p["selector"], p["file_path"]),
+            "upload_file":       lambda: self.upload_file(p["selector"], p.get("files") or p.get("file_path")),
             "hover":             lambda: self.hover(p["selector"]),
             "scroll":            lambda: self.scroll(p.get("selector"), p.get("x", 0), p.get("y", 500),
                                                      p.get("direction")),
@@ -684,10 +792,11 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth,
             "is_visible":        lambda: self.is_visible(p["selector"]),
             "is_enabled":        lambda: self.is_enabled(p["selector"]),
             "is_checked":        lambda: self.is_checked(p["selector"]),
-            "eval_js":           lambda: self.eval_js(p["script"], p.get("selector")),
+            "eval_js":           lambda: self.eval_js(p["script"], p.get("selector"), p.get("isolated", False)),
             "get_title":         lambda: self.get_title(),
             "get_url":           lambda: self.get_url(),
             "reload":            lambda: self.reload(p.get("wait_until", "networkidle")),
+            "go_back":           lambda: self.go_back(p.get("wait_until", "load")),
             # 标签页/持久化/断言（来自 BrowserProxyTabs mixin）
             "new_tab":           lambda: self.new_tab(p.get("name", "tab_" + str(len(self._pages)))),
             "new_isolated_session": lambda: self.new_isolated_session(p["name"], p.get("profile")),
@@ -740,6 +849,7 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth,
             "get_a11y_tree":     lambda: self.get_a11y_tree(p.get("root_selector"), p.get("interesting_only", True)),
             "switch_frame":      lambda: self.switch_frame(p.get("selector"), p.get("name"), p.get("url_contains")),
             "switch_to_main_frame": lambda: self.switch_to_main_frame(),
+            "list_frames":       lambda: self.list_frames(),
             "get_page_health":   lambda: self.get_page_health(),
             "scroll_until_found": lambda: self.scroll_until_found(p["selector"], p.get("max_scrolls", 10), p.get("scroll_step", 800), p.get("timeout_per_scroll", 1000)),
             "find_and_act":      lambda: self.find_and_act(p["description"], p.get("act", "click"), p.get("value")),

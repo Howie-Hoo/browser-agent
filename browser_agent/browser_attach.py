@@ -16,6 +16,21 @@
 - **身份 pin**：偏好保存的是浏览器数据目录（端口随浏览器重启变化，每次连接重读）
 - 探测范围限定在已知浏览器数据目录与显式给出的目录内，不做全盘扫描
 
+失败分类（resolve_endpoint 返回 class 字段，remedy 按类给出——不同失败该做的
+事完全不同，一律套同一段「开调试开关」提示是误导）：
+- config-error   配置本身有误（目录不是数据目录 / 端点格式不对）→ 改配置，与
+                 服务是否在运行无关
+- unavailable    目标浏览器连不上，reason 细分四类：
+                 not-enabled   没有 DevToolsActivePort（浏览器未运行，或开关未开）
+                 offline       端口文件在、端口不在监听（浏览器已退出/崩溃残留）
+                 unreadable    端口文件无权读取（macOS TCC 等）→ 指向显式端点配置
+                 invalid       端口文件内容损坏
+- ambiguous      检测到多台浏览器且无偏好 → 必须明确选择，拒绝猜测
+- not-found      没检测到任何可辨认的 Chromium 数据目录
+
+unavailable 的处理顺序对 agent 友好：**能自动解决的不打扰用户**——先建议 agent
+用系统命令代开浏览器再重试，仍失败才升级为需要用户开调试开关。
+
 前置条件：用户在其浏览器打开 chrome://inspect/#remote-debugging（Edge 为
 edge://inspect/#remote-debugging）勾选 "Allow remote debugging for this browser
 instance"（可能需重启浏览器）。
@@ -24,6 +39,7 @@ from __future__ import annotations
 
 import collections
 import concurrent.futures
+import errno as _errno
 import os
 import re
 import socket
@@ -74,6 +90,26 @@ _BROWSER_ROOTS = {
     ],
 }
 
+# 代开浏览器的系统命令建议（按平台；None = 无已知命令，用通用提示）。
+# 只用于错误提示里让 agent 代开浏览器——工具自己不启动 GUI 应用。
+_LAUNCH_CMDS = {
+    # name: (darwin, win32, linux)
+    "Chrome":         ('open -a "Google Chrome"', "start chrome", "google-chrome"),
+    "Chrome Canary":  ('open -a "Google Chrome Canary"', None, "google-chrome-canary"),
+    "Edge":           ('open -a "Microsoft Edge"', "start msedge", "microsoft-edge"),
+    "Brave":          ('open -a Brave', "start brave", "brave-browser"),
+    "Vivaldi":        ('open -a Vivaldi', None, "vivaldi"),
+    "Opera":          ('open -a Opera', None, "opera"),
+    "Opera GX":       ('open -a "Opera GX"', None, "opera"),
+    "Arc":            ('open -a Arc', None, None),
+    "Dia":            ('open -a Dia', None, None),
+    "Chromium":       ('open -a Chromium', "start chromium", "chromium"),
+    "Chromium (snap)":  (None, None, "snap run chromium"),
+    "Chrome (flatpak)": (None, None, "flatpak run com.google.Chrome"),
+    "Edge (flatpak)":   (None, None, "flatpak run com.microsoft.Edge"),
+    "Brave (flatpak)":  (None, None, "flatpak run com.brave.Browser"),
+}
+
 REMEDY_STEPS = (
     "在目标浏览器地址栏打开 chrome://inspect/#remote-debugging"
     "（Edge 为 edge://inspect/#remote-debugging），勾选"
@@ -85,14 +121,18 @@ REMEDY_STEPS = (
 
 
 _WIN_ENV_RE = re.compile(r"%([A-Za-z0-9_]+)%")
+_QUOTED = re.compile(r'^(["\'])(.*)\1$')
 
 
 def _expand(path: str) -> str:
-    """展开 ~ 与 Windows 环境变量（%LOCALAPPDATA% 等）后归一路径。
+    """展开 ~、Windows 环境变量（%LOCALAPPDATA% 等）与成对引号后归一路径。
 
     引用了未设置的环境变量时抛 ValueError（配置写错应显式报错，不静默保留字面量）。
     """
     v = str(path).strip()
+    m = _QUOTED.match(v)
+    if m:
+        v = m.group(2).strip()
     if os.name == "nt":
         def _sub(m: "re.Match[str]") -> str:
             val = os.environ.get(m.group(1).upper())
@@ -112,7 +152,7 @@ def _expand_safe(path: str) -> str:
     try:
         return _expand(path)
     except ValueError:
-        return os.path.normpath(os.path.expanduser(str(path).strip()))
+        return os.path.normpath(os.path.expanduser(_QUOTED.sub(r"\2", str(path).strip())))
 
 
 def is_browser_data_dir(path: str) -> bool:
@@ -123,60 +163,152 @@ def is_browser_data_dir(path: str) -> bool:
         return False
 
 
-def read_devtools_endpoint(path: str) -> Optional[dict]:
-    """读数据目录下 DevToolsActivePort → {"port": int, "endpoint": url}。
+# ── DevToolsActivePort 读取（四分类的唯一事实来源）──────────────
 
-    首行端口号，次行（若有）是 browser WebSocket 路径。新式开关
-    （chrome://inspect 勾选 "Allow remote debugging"）会禁用 /json/version
-    等 HTTP 端点（连接 http:// 会 404 "not a DevTools server"），只认文件里
-    的 ws 路径——因此有次行时必须用 ws:// 直连；无次行（旧式命令行启动）
-    回退 http://。
+def read_devtools_info(path: str) -> dict:
+    """读数据目录下的 DevToolsActivePort → 结构化结果。
+
+    成功：{"ok": True, "port": int, "ws_path": str, "endpoint": str}
+      首行端口号，次行（若有）是 browser WebSocket 路径。新式开关
+      （chrome://inspect 勾选）会禁用 /json/version 等 HTTP 端点，只认文件里
+      的 ws 路径——因此有次行时必须 ws:// 直连；无次行（旧式命令行启动）
+      回退 http://。
+    失败：{"ok": False, "reason": not-enabled|unreadable|invalid, "detail": str}
     """
+    file = os.path.join(path, "DevToolsActivePort")
     try:
-        with open(os.path.join(path, "DevToolsActivePort"), "r", encoding="ascii") as f:
-            lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
-        if not lines:
-            return None
+        with open(file, "r", encoding="ascii") as f:
+            content = f.read()
+    except OSError as e:
+        if e.errno in (_errno.ENOENT, _errno.ENOTDIR):
+            # 文件/目录不存在（浏览器没运行或开关没开是最常见成因）→ 未开启
+            return {"ok": False, "reason": "not-enabled",
+                    "detail": "没有 DevToolsActivePort（浏览器未运行，或远程调试开关未开启）"}
+        return {"ok": False, "reason": "unreadable",
+                "detail": f"无法读取 DevToolsActivePort（{type(e).__name__}"
+                          f"{f' errno={e.errno}' if e.errno else ''}）"}
+    except ValueError:
+        # UnicodeDecodeError 是 ValueError 不是 OSError：撕裂写/崩溃残留的非 ASCII
+        # 字节正是 invalid 分类存在的理由，不能裸抛（会炸掉 /attach/discover）
+        return {"ok": False, "reason": "invalid",
+                "detail": "DevToolsActivePort 含非 ASCII 字节（文件损坏，完全退出并"
+                          "重启浏览器可重写该文件）"}
+    lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+    if not lines:
+        return {"ok": False, "reason": "invalid", "detail": "DevToolsActivePort 为空文件"}
+    try:
         port = int(lines[0])
-        ws_path = lines[1] if len(lines) > 1 else ""
-        endpoint = f"ws://127.0.0.1:{port}{ws_path}" if ws_path else f"http://127.0.0.1:{port}"
-        return {"port": port, "endpoint": endpoint}
-    except (OSError, ValueError):
+        if not (1 <= port <= 65535):
+            raise ValueError
+    except ValueError:
+        return {"ok": False, "reason": "invalid",
+                "detail": f"DevToolsActivePort 端口行无效: {lines[0]!r}"}
+    ws_path = lines[1] if len(lines) > 1 else ""
+    endpoint = f"ws://127.0.0.1:{port}{ws_path}" if ws_path else f"http://127.0.0.1:{port}"
+    return {"ok": True, "port": port, "ws_path": ws_path, "endpoint": endpoint}
+
+
+def read_devtools_endpoint(path: str) -> Optional[dict]:
+    """兼容入口：成功返回 {"port", "endpoint"}，任何失败返回 None。"""
+    info = read_devtools_info(path)
+    if not info.get("ok"):
         return None
+    return {"port": info["port"], "endpoint": info["endpoint"]}
 
 
 def read_devtools_port(path: str) -> Optional[int]:
-    """读数据目录下 DevToolsActivePort 的端口号（仅展示用；连接请用 read_devtools_endpoint）。"""
-    info = read_devtools_endpoint(path)
-    return info["port"] if info else None
+    """读端口号（仅展示用；连接与分类请用 read_devtools_info）。"""
+    info = read_devtools_info(path)
+    return info["port"] if info.get("ok") else None
 
+
+# ── 浏览器发现（清单内）────────────────────────────────────
 
 def default_roots() -> list:
     key = "win32" if os.name == "nt" else ("darwin" if os.path.exists("/System/Library/CoreServices") else "linux")
     return list(_BROWSER_ROOTS.get(key, []))
 
 
+def display_name(data_dir: str) -> str:
+    """数据目录路径里最有辨识度的文件夹名（跳过通用的 User Data 层）。"""
+    parts = [p for p in re.split(r"[\\/]+", str(data_dir)) if p]
+    for p in reversed(parts):
+        if p.lower() != "user data":
+            return p
+    return str(data_dir)
+
+
+def browser_launch_hint(name: str) -> str:
+    """打开该浏览器的系统命令建议（供 agent 代开浏览器；无映射时通用提示）。"""
+    cmds = _LAUNCH_CMDS.get(name)
+    if cmds:
+        if os.name == "nt":
+            cmd = cmds[1]
+        elif sys.platform == "darwin":
+            cmd = cmds[0]
+        else:
+            cmd = cmds[2]
+        if cmd:
+            return f"`{cmd}`"
+    return "用系统方式打开该浏览器（应用列表 / 开始菜单 / Dock）"
+
+
+# offline 细节的唯一文案（describe 与各解析路径共用，防漂移）
+_OFFLINE_DETAIL = "DevToolsActivePort 记录的端口 {port} 未在监听（浏览器未运行或开关已关闭）"
+
+
+def _describe_browser_dir(data_dir: str, known_names: Optional[dict] = None) -> dict:
+    """单个数据目录的探测结论：显示名 + 远程调试状态（端口文件 + TCP 探测）。
+
+    这是「读端口文件 → TCP 探测 → 四分类」的**单点实现**：discover / probe /
+    _resolve_dir / _auto_resolve 全部消费它的结论，不各自重探。成功时一并给出
+    endpoint（调用方不必为拿 ws 路径重读文件）。TCP 探测区分「端口文件在但
+    浏览器没在听」（崩溃残留的 stale 文件）——只看文件会把已退出的浏览器误报
+    为可附着。显示名优先取已知清单规范名（与 find-url --browser 用同一套名字），
+    清单外才退回路径推断名。
+    """
+    data_name = (known_names or {}).get(_realpath_or_self(data_dir)) or display_name(data_dir)
+    info = read_devtools_info(data_dir)
+    if info.get("ok"):
+        port = info["port"]
+        listening = port_listening(port)
+        remote = {"enabled": listening, "port": port, "detail":
+                  "" if listening else _OFFLINE_DETAIL.format(port=port)}
+        if listening:
+            # 端点随结论一并给出：消费方（resolve/auto）无需重读端口文件
+            remote["ws_path"] = info["ws_path"]
+            remote["endpoint"] = info["endpoint"]
+        else:
+            # offline 是四分类之一，但文件读取层判不了它（需要 TCP）——
+            # 在这里补上 reason，保证 auto 解析路径不会把它误标成 not-enabled
+            remote["reason"] = "offline"
+    else:
+        reason, detail = info.get("reason"), info.get("detail", "")
+        if reason == "unreadable":
+            detail = detail + "；可在偏好中配置 BROWSER_AGENT_CDP_ENDPOINT 显式指定已核对的端口"
+        remote = {"enabled": False, "port": None, "reason": reason, "detail": detail}
+    return {"name": data_name, "data_dir": data_dir,
+            "remote_debugging": remote,
+            "attach_hint": f'browser-agent-client attach "{data_dir}"'}
+
+
 def discover_browsers(roots: Optional[list] = None) -> list:
     """列出本机已安装且数据目录可辨认的浏览器（含远程调试端口状态）。
 
     只在已知目录清单内探测；不做目录名模糊扫描、不读目录内容以外的任何文件。
+    remote_debugging 以 TCP 探测为准（文件存在但端口不在监听 = False + detail 说明）。
     """
-    found = []
+    entries = []
     for name, raw_dir in (roots if roots is not None else default_roots()):
-        d = _expand(raw_dir)
+        d = _expand_safe(raw_dir)
         if not is_browser_data_dir(d):
             continue
-        port = read_devtools_port(d)
-        found.append({
-            "name": name,
-            "dir": d,
-            "debug_port": port,
-            "remote_debugging": port is not None,
-        })
-    return found
+        entries.append(_describe_browser_dir(d, {_realpath_or_self(d): name}))
+    return entries
 
 
 # ── 偏好持久化（~/.browser-agent/attach.env）────────────────
+
 def preference_file() -> str:
     return os.path.join(data_dir(), "attach.env")
 
@@ -223,87 +355,204 @@ def save_preference(attach_dir: Optional[str] = None,
     return {"ok": True, "preference_file": preference_file(), **new}
 
 
-# ── 端点解析 ────────────────────────────────────────────────
-def error_response(error: str, candidates: Optional[list] = None) -> dict:
-    """附着失败的统一错误报文（error + remedy + 可选候选浏览器清单）。"""
-    res = {"ok": False, "error": error, "remedy": REMEDY_STEPS}
+# ── 端点解析（失败分类 + 分类 remedy）────────────────────────
+
+def error_response(error: str, candidates: Optional[list] = None, *,
+                   klass: str, reason: Optional[str] = None,
+                   remedy: Optional[list] = None) -> dict:
+    """附着失败的统一错误报文。
+
+    klass 为必填关键字（config-error | unavailable | ambiguous | not-found）——
+    分类决定 remedy 语义，缺省值会让调用方拿到「目标不可达」的指引去做
+    「修配置」的事；remedy 为分步列表；candidates 为本机检测到的浏览器。
+    """
+    res = {"ok": False, "error": error, "class": klass, "remedy": remedy or [REMEDY_STEPS]}
+    if reason:
+        res["reason"] = reason
     if candidates:
         res["candidates"] = candidates
     return res
+
+
+def _validate_endpoint_format(endpoint: str) -> Optional[str]:
+    """端点格式校验；返回错误信息，None = 合法。"""
+    try:
+        u = urlparse(str(endpoint))
+    except ValueError:
+        return f"CDP 端点格式无效: {endpoint}"
+    if u.scheme not in ("ws", "http") or not u.hostname:
+        return (f"CDP 端点须为 ws:// 或 http:// 且带主机"
+                f"（如 ws://127.0.0.1:9222/devtools/browser/xxx），当前: {endpoint}")
+    return None
+
+
+def _unavailable_remedy(reason: str, detail: str, browser_label: str) -> list:
+    """unavailable 四分类各自的分步处理（agent 优先自动解，再升级找用户）。"""
+    if reason == "unreadable":
+        return [
+            f"系统拒绝读取该浏览器的 DevToolsActivePort（{detail}）。",
+            "出路：确认该浏览器真实监听的调试端口后，在偏好中配置 "
+            "BROWSER_AGENT_CDP_ENDPOINT=ws://127.0.0.1:<端口>（browser-agent-client "
+            "attach <ws://端点> 即可保存），不会猜测端口或切换浏览器。",
+        ]
+    if reason == "invalid":
+        return [
+            f"{browser_label} 的 DevToolsActivePort 内容损坏（{detail}）。",
+            f"出路：完全退出 {browser_label} 再重新打开（让其重写端口文件），然后重试。",
+        ]
+    # not-enabled / offline：共同根因大概率是浏览器没在运行——agent 先代开
+    return [
+        f"{browser_label} 的远程调试端口不可用（{detail}）。",
+        f"Agent 先代开浏览器再重试（系统命令示例：{browser_launch_hint(browser_label)}）"
+        "——浏览器没在运行是最常见成因，打开即可自愈。",
+        f"仍失败再请用户处理：{REMEDY_STEPS}",
+    ]
+
+
+def _unavailable(error_line: str, label: str, reason: str, detail: str,
+                 candidates: Optional[list] = None) -> dict:
+    """unavailable 类错误的统一构造：各调用点只贡献自己的错误行，其余接线一处定。"""
+    return error_response(
+        error_line, candidates=candidates, klass="unavailable", reason=reason,
+        remedy=_unavailable_remedy(reason, detail, label))
+
+
+_CONFIG_ERROR_REMEDY = [
+    "该目录不是 Chromium 浏览器的用户数据目录（须为含 Local State 的那一层）。",
+    "确认真实路径：browser-agent-client attach --discover 列出已知浏览器，"
+    "清单外用 attach --probe <应用数据根目录下的文件夹> 探测。",
+    "改正偏好（browser-agent-client attach <正确目录>）后重试——"
+    "这是配置问题，不需要重启或停止服务即可改正。",
+]
+
+
+def validate_attach_dir(raw: str) -> dict:
+    """attach 目录的规范校验（client.attach 与 POST /attach/select 共用的单一入口）。
+
+    成功：{"ok": True, "dir": <展开后的绝对路径>}
+    失败：标准 config-error 报文（klass/reason/remedy 在本模块单点定义）。
+    """
+    try:
+        d = expand_path(raw)
+    except ValueError as e:
+        return error_response(f"attach 目录路径无效: {e}", klass="config-error",
+                              remedy=["修正路径写法（~ 展开 / Windows 环境变量）后重试。"])
+    if not is_browser_data_dir(d):
+        return error_response(
+            f"目录不是浏览器数据目录（缺少 Local State）: {d}",
+            candidates=discover_browsers(), klass="config-error",
+            remedy=_CONFIG_ERROR_REMEDY)
+    return {"ok": True, "dir": d}
+
+
+def _resolve_dir(target_dir: str) -> dict:
+    """解析指定数据目录 → 端点（happy path 不做全盘扫描，失败才带 candidates）。
+
+    探测走 _describe_browser_dir 单点实现（读文件 + TCP 各一次），不在本函数重探。
+    """
+    if not is_browser_data_dir(target_dir):
+        return error_response(
+            f"配置的浏览器数据目录无效（不含 Local State）: {target_dir}",
+            candidates=discover_browsers(), klass="config-error",
+            remedy=_CONFIG_ERROR_REMEDY)
+    label = display_name(target_dir)
+    rd = _describe_browser_dir(target_dir)["remote_debugging"]
+    if rd["enabled"]:
+        return {"ok": True, "endpoint": rd["endpoint"],
+                "browser_dir": target_dir, "port": rd["port"], "source": "configured-dir"}
+    return _unavailable(
+        f"浏览器 {label}（{target_dir}）远程调试不可用：{rd['detail']}",
+        label, rd.get("reason", "not-enabled"), rd["detail"],
+        candidates=discover_browsers())
+
+
+def _auto_resolve() -> dict:
+    """无显式目标：仅当恰好一台可用时自动采用；多台要求明确选择。"""
+    candidates = discover_browsers()
+    with_debug = [c for c in candidates if c["remote_debugging"]["enabled"]]
+
+    def _pick(c, source):
+        rd = c["remote_debugging"]
+        return {"ok": True, "endpoint": rd["endpoint"], "browser_dir": c["data_dir"],
+                "port": rd["port"], "source": source}
+
+    if len(candidates) == 1:
+        c = candidates[0]
+        rd = c["remote_debugging"]
+        if not rd["enabled"]:
+            return _unavailable(
+                f"唯一检测到的浏览器 {c['name']} 远程调试不可用：{rd['detail']}",
+                c["name"], rd.get("reason", "not-enabled"), rd["detail"], candidates)
+        return _pick(c, "auto-single")
+    if len(with_debug) == 1:
+        return _pick(with_debug[0], "auto-single-debug")
+    if len(candidates) > 1:
+        return error_response(
+            "检测到多台浏览器，未配置偏好，拒绝猜测目标",
+            candidates=candidates, klass="ambiguous",
+            remedy=[
+                "必须明确选择其一（即使只开着一台调试，也建议固化偏好）：",
+                *[f"browser-agent-client attach \"{c['data_dir']}\"    # {c['name']}"
+                  for c in candidates],
+                "或通过环境变量 BROWSER_AGENT_ATTACH_DIR / 配置 browser.attach_dir 指定。",
+            ],
+        )
+    return error_response(
+        "未找到任何可辨认的 Chromium 系浏览器数据目录",
+        klass="not-found",
+        remedy=[
+            "browser-agent-client attach --discover 查看已知清单与应用数据根目录文件夹名；",
+            "清单外浏览器：从文件夹名认出候选后 attach --probe <文件夹> 受控探测；",
+            f"确认远程调试已开启（{REMEDY_STEPS}）。",
+        ],
+    )
 
 
 def resolve_endpoint(attach_dir: Optional[str] = None,
                      cdp_endpoint: Optional[str] = None) -> dict:
     """解析附着端点。优先级：显式 cdp_endpoint > 显式 attach_dir > 已存偏好 > 唯一已装浏览器。
 
-    返回 {"ok": True, "endpoint": "http://127.0.0.1:PORT", "browser_dir":..., "port":...}
-    或 {"ok": False, "error", "remedy", "candidates"}。绝不静默换目标浏览器。
+    返回 {"ok": True, "endpoint": ..., "browser_dir": ..., "source": ...}
+    或 {"ok": False, "error", "class", "reason"?, "remedy": [...], "candidates"?}。
+    绝不静默换目标浏览器。
     """
     pref = read_preference()
     explicit_dir = _expand_safe(attach_dir) if attach_dir else None
 
-    # 显式 cdp_endpoint 最优先；其次（未显式给目录时）已保存的端点偏好。
-    # 显式端点无需发现候选——提前返回，省一次全根扫描
+    # 显式 cdp_endpoint 最优先；其次（未显式给目录时）已保存的端点偏好
     endpoint = cdp_endpoint or ""
     if not endpoint and explicit_dir is None:
         endpoint = pref["cdp_endpoint"]
     if endpoint:
+        fmt_err = _validate_endpoint_format(endpoint)
+        if fmt_err:
+            return error_response(fmt_err, klass="config-error",
+                                  remedy=["修正端点写法（ws:// 或 http:// + 主机）后重试。"])
         return {"ok": True, "endpoint": endpoint, "browser_dir": None,
                 "source": "explicit-endpoint"}
 
-    dir_candidates = discover_browsers()
-
-    target_dir = explicit_dir or pref["attach_dir"]
+    target_dir = explicit_dir or (pref["attach_dir"] or None)
     if target_dir:
-        if not is_browser_data_dir(target_dir):
-            return _err(
-                f"配置的浏览器数据目录无效（不含 Local State）: {target_dir}",
-                candidates=dir_candidates,
-            )
-        ep = read_devtools_endpoint(target_dir)
-        if ep is None:
-            return _err(
-                f"浏览器 {target_dir} 未开放远程调试（读不到 DevToolsActivePort）",
-                candidates=dir_candidates,
-            )
-        return {"ok": True, "endpoint": ep["endpoint"],
-                "browser_dir": target_dir, "port": ep["port"], "source": "configured-dir"}
-
-    # 无显式配置、无偏好：仅当恰好一台可辨认浏览器时才自动采用；多台则要求明确选择
-    with_debug = [c for c in dir_candidates if c["remote_debugging"]]
-    if len(dir_candidates) == 1:
-        c = dir_candidates[0]
-        if not c["remote_debugging"]:
-            return _err(f"唯一检测到的浏览器 {c['name']} 未开放远程调试", candidates=dir_candidates)
-        ep = read_devtools_endpoint(c["dir"])
-        return {"ok": True, "endpoint": ep["endpoint"],
-                "browser_dir": c["dir"], "port": ep["port"], "source": "auto-single"}
-    if len(with_debug) == 1:
-        c = with_debug[0]
-        ep = read_devtools_endpoint(c["dir"])
-        return {"ok": True, "endpoint": ep["endpoint"],
-                "browser_dir": c["dir"], "port": ep["port"], "source": "auto-single-debug"}
-    if len(dir_candidates) > 1:
-        return _err(
-            "检测到多台浏览器，未配置偏好，拒绝猜测目标",
-            candidates=dir_candidates,
-        )
-    return _err("未找到任何可辨认的 Chromium 系浏览器数据目录", candidates=dir_candidates)
-
-
-_err = error_response  # 模块内沿用历史名
+        return _resolve_dir(target_dir)
+    return _auto_resolve()
 
 
 def format_attach_error(info: dict) -> str:
-    """把 resolve_endpoint 的失败结果格式化为给 AI/用户的可执行报错。"""
-    msg = f"附着日常浏览器失败: {info.get('error')}\n处理步骤: {info.get('remedy')}"
+    """把 resolve_endpoint 的失败结果格式化为给 AI/用户的可执行报错（分类分步）。"""
+    msg = f"附着日常浏览器失败: {info.get('error')}"
+    remedy = info.get("remedy") or []
+    if remedy:
+        msg += "\n处理步骤:"
+        for i, step in enumerate(remedy, 1):
+            msg += f"\n {i}. {step}"
     cands = info.get("candidates") or []
     if cands:
-        lines = [f"- {c['name']}: {c['dir']}（远程调试{'已开' if c['remote_debugging'] else '未开'}）"
-                 for c in cands]
+        lines = []
+        for c in cands:
+            rd = c.get("remote_debugging") or {}
+            state = "已开（端口在监听）" if rd.get("enabled") else f"未就绪 — {rd.get('detail', '未开')}"
+            lines.append(f"- {c['name']}: {c.get('data_dir', c.get('dir', ''))}（远程调试{state}）")
         msg += "\n本机检测到的浏览器:\n" + "\n".join(lines)
-        msg += ("\n指定其一: browser-agent-client attach <数据目录>（保存偏好后重启服务），"
-                "或配置 browser.attach_dir / 环境变量 BROWSER_AGENT_ATTACH_DIR")
     return msg
 
 
@@ -344,6 +593,18 @@ def reset_pin() -> None:
     _PROCESS_PIN["dir"] = None
 
 
+def _identity_path(p: str) -> str:
+    """目录身份的归一比较键：真实路径 + 大小写归一。
+
+    macOS（APFS 默认大小写不敏感卷）与 Windows 上，同一浏览器的目录写法
+    大小写不同也应视为同一身份——否则会把「偏好重存一次」误判成换目标。
+    """
+    rp = _realpath_or_self(p)
+    if sys.platform == "darwin" or os.name == "nt":
+        return rp.casefold()
+    return rp
+
+
 def pin_mismatch_error(new_identity: Optional[str]) -> Optional[str]:
     """新身份与已 pin 身份不同 → 可直接展示的错误；相同/无法比较 → None。"""
     old = _PROCESS_PIN["dir"]
@@ -353,7 +614,7 @@ def pin_mismatch_error(new_identity: Optional[str]) -> Optional[str]:
     if old.startswith("endpoint:") or new.startswith("endpoint:"):
         if old == new:
             return None
-    elif _realpath_or_self(old) == _realpath_or_self(new):
+    elif _identity_path(old) == _identity_path(new):
         return None
     return (f"本服务进程已附着浏览器 {old}，拒绝改连 {new}（不静默切换目标浏览器）。"
             "如确要切换：先 browser-agent-client shutdown 停止服务，"
@@ -423,15 +684,6 @@ def list_app_data_folders() -> list:
     return out
 
 
-def display_name(data_dir: str) -> str:
-    """数据目录路径里最有辨识度的文件夹名（跳过通用的 User Data 层）。"""
-    parts = [p for p in re.split(r"[\\/]+", str(data_dir)) if p]
-    for p in reversed(parts):
-        if p.lower() != "user data":
-            return p
-    return str(data_dir)
-
-
 def _strictly_inside(path: str, root: str) -> bool:
     """统一路径包含谓词的模块内别名（实现在 utils.strictly_inside）。"""
     from .utils import strictly_inside
@@ -482,40 +734,26 @@ def _known_browser_names() -> dict:
             for name, raw in default_roots()}
 
 
-def _describe_browser_dir(data_dir: str, known_names: dict) -> dict:
-    """单个数据目录的探测结论：显示名 + 远程调试状态（只读端口文件 + TCP）。
-
-    显示名优先取已知清单里的规范名（find-url --browser / default_roots 用同一
-    套名字），清单外才退回路径推断名——两个入口的名字可互查。"""
-    data_name = known_names.get(os.path.realpath(data_dir)) or display_name(data_dir)
-    port = read_devtools_port(data_dir)
-    if port is not None:
-        listening = port_listening(port)
-        remote = {"enabled": listening, "port": port, "detail":
-                  "" if listening else
-                  f"DevToolsActivePort 记录的端口 {port} 未在监听（浏览器未运行或开关已关闭）"}
-    else:
-        port_file = os.path.join(data_dir, "DevToolsActivePort")
-        try:
-            exists = os.path.isfile(port_file)
-        except OSError:
-            exists = False
-        remote = {"enabled": False, "port": None, "detail":
-                  ("无法读取 DevToolsActivePort（权限不足）" if exists
-                   else "没有 DevToolsActivePort（浏览器未运行或远程调试开关未开启）")}
-    return {"name": data_name, "data_dir": data_dir,
-            "remote_debugging": remote,
-            "attach_hint": f'browser-agent-client attach "{data_dir}"'}
-
-
 def discover_payload() -> dict:
     """/attach/discover（HTTP）与 client attach --discover（CLI）共用的单一构造：
-    已知浏览器 + 应用数据根目录文件夹名 + probe 提示 + 处理步骤。"""
-    return {"ok": True, "browsers": discover_browsers(),
-            "app_data_folders": list_app_data_folders(),
-            "probe_hint": ("清单外的浏览器：从应用数据根目录的文件夹名里认出"
-                           "候选（如 Dia、BraveSoftware），用 attach --probe <文件夹> 探测"),
-            "remedy": REMEDY_STEPS}
+    已知浏览器 + 应用数据根目录文件夹名 + Agent 下一步 + 处理步骤。"""
+    return {
+        "ok": True,
+        "browsers": discover_browsers(),
+        "app_data_folders": list_app_data_folders(),
+        "next_steps": [
+            "1. 从 browsers 里选目标（远程调试已开的即可直接附着）；清单外浏览器从"
+            " app_data_folders 的文件夹名认出候选（如 Dia、BraveSoftware）",
+            "2. 清单外候选用受控探测确认数据目录与调试状态："
+            'browser-agent-client attach --probe <文件夹名>',
+            "3. 保存偏好并启动：browser-agent-client attach <数据目录>"
+            "（之后 start 自动按偏好附着）",
+            "4. 远程调试未开的浏览器，先处理开关：见 remedy",
+        ],
+        "probe_hint": ("清单外的浏览器：从应用数据根目录的文件夹名里认出"
+                       "候选（如 Dia、BraveSoftware），用 attach --probe <文件夹> 探测"),
+        "remedy": REMEDY_STEPS,
+    }
 
 
 def probe_app_data_folder(arg: str) -> dict:

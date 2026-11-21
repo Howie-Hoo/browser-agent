@@ -25,8 +25,12 @@ description: Python Playwright 浏览器操作代理：AI 驱动、语义感知�
 启动或确认服务后，`GET /status`（或 `browser-agent-client status`）会输出：
 
 - `browser_mode`：`managed`（自拉隔离 Chromium）/ `attach`（附着日常浏览器）
-- `site_patterns`：**已积累的站点经验域名列表**——确定目标网站后，若列表命中，
-  **必须先 `read_site` 读取先验**（平台特征 / 有效模式 / 已知陷阱）再操作
+- `site_patterns`：**已积累的站点经验列表（域名 + 别名）**——用户提到某站点时
+  **先 `read_site` 取先验**（平台特征 / 有效模式 / 已知陷阱）再选入口；入参可以
+  是域名/URL，也可以是**用户原话**（「去小红书搜xx」能直接对上 `xiaohongshu.com`
+  的经验——「URL 必须带 token、得从搜索进」这类先验恰恰决定入口怎么选）
+- `browser_starting`：浏览器连接中（attach 时≈等待用户在浏览器点「允许」）
+- `log_file`：服务全生命周期日志路径（排障先看这里）
 - `user_data_dir`：用户数据目录（profiles / 站点经验 / 状态，升级不丢）
 
 ## 操作哲学
@@ -73,7 +77,10 @@ GUI 式还是**探测手段**：一次真实交互能观察到站点的实际行
   （URL 缺参数、触发风控），而非内容真的不存在。换一种到达方式再下结论。
 
 **eval_js 提取要点**：大量数据用 `JSON.stringify(...)` 包裹后返回字符串（信息密度
-最高、序列化稳定）；DOM 节点不能直接返回，须提取属性；支持 async 表达式。
+最高、序列化稳定）；DOM 节点不能直接返回，须提取属性；支持 async 表达式。反自动化
+页面改写了 `document.querySelectorAll` 等 DOM API 时，`eval_js` 传 `isolated: true`
+在隔离环境执行（干净 DOM 视图；代价是看不到页面自己的 JS 全局变量，且只作用于
+主文档——已 switch_frame 进 iframe 时先 `switch_to_main_frame`）。
 
 ## 通道选择：先问要不要开浏览器
 
@@ -128,10 +135,13 @@ browser-agent-client find-url agent --only history --limit 0
 
 操作经验按域名积累在 `~/.browser-agent/site-patterns/{domain}.md`，跨会话复用：
 
-- **读**：前置检查输出 `site_patterns` 列表；`navigate` 到已积累域名时响应自动附
-  `site_experience` 提示。命中即先 `read_site`（领域/子域名/别名自动匹配）获取先验。
+- **读（前置到选入口之前）**：`/status` 的 `site_patterns` 列出域名+别名；确定目标
+  站点后**先** `read_site` 取先验——入参可以是域名/URL，也可以是用户原话（自由
+  文本按别名/域名字串匹配，`read_site("去小红书搜xx")` 直接命中）。`navigate` 到
+  已积累域名时响应也会自动附 `site_experience` 提示兜底。
 - **写**：任务成功后，发现了可复用的模式（URL 结构、选择器、操作策略）或陷阱
-  （什么会失败及为什么），用 `write_site` 记录。**只写经验证的事实，不写猜测。**
+  （什么会失败及为什么），用 `write_site` 记录（别名写进 `aliases`——用户怎么说
+  这个站点，就留什么别名，下次原话才能对上）。**只写经验证的事实，不写猜测。**
 - **态度**：经验条目带发现日期，当作「可能有效的提示」而非「保证正确的事实」。
   按经验操作失败 → 回退通用模式 → 更新经验文件。
 
@@ -183,7 +193,10 @@ Chromium 单实例常驻数百 MB 内存；低配机器余量不足时强行启�
 
 **连接授权与空闲回收**：Chrome 新式开关（chrome://inspect 勾选）下，**每条新调试连接
 都要用户在浏览器里点一次允许**——因此服务采用长驻单连接：附着时点一次，之后所有操作
-复用。空闲回收（`BROWSER_AGENT_IDLE_SHUTDOWN_SEC`，默认 900s，0=禁用）在 attach 模式
+复用；client 的 `start`/`attach` 在 attach 模式会等浏览器真正连上（2s 未连上即打印
+授权提示，窗口 `BROWSER_AGENT_ATTACH_READY_SEC` 默认 20s；超时**不杀服务**，CLI 退出码
+2 告知需要用户动作，处理完下一个请求自动重试）。空闲回收
+（`BROWSER_AGENT_IDLE_SHUTDOWN_SEC`，默认 900s，0=禁用）在 attach 模式
 **只关超时会话的自建标签页、连接保持不断**：既防孤儿标签页，又不用重新授权。
 
 **attach 安全边界**：不扫描固定端口，只读所配置浏览器数据目录的
@@ -326,6 +339,26 @@ storage:
 iframe / 状态持久化 / 认证会话 profile / 站点经验 / 宏指令 / 通用参数）与 HTTP 端点
 清单见 [`docs/command-reference.md`](docs/command-reference.md)——查询型参考，按需 Ctrl+F。
 
+**HTTP 调用约束**（本机 API 的来源校验，curl 示例须带 JSON 头）：
+
+```bash
+curl -s http://127.0.0.1:7788/status                                  # GET 无 body，无要求
+curl -s -X POST http://127.0.0.1:7788/run \
+     -H "Content-Type: application/json" -d '{"commands":[...]}'       # 带 body 必须 JSON
+```
+
+- 带 body 的请求必须 `Content-Type: application/json`（否则 415）；
+- 带浏览器 `Origin` 头的请求一律 403——浏览器页面不是本服务的客户端（防任意网页
+  跨站驱动本机服务，attach 模式下那等于交出用户登录态）；
+- `Host` 必须是本机回环主机名（防 DNS rebinding 读走响应）；
+- `/shutdown` 是实例门控的维护端点：先 `GET /status` 取 `instance_id`，随
+  `POST /shutdown {"instance_id": "..."}` 提交；不匹配返回 409（防止误停已被替换的
+  新实例）。业务端点恒返 200（成败看 `ok`），协议级拒绝（403/415/409）除外。
+
+**CLI 退出码**（agent 脚本可分支，不必解析输出文本）：`0` 成功；`1` 硬失败；
+`2` 需要用户动作——服务已在但浏览器未连上（attach 等授权弹窗、目标浏览器未开/未开
+调试开关），处理完重试即可。
+
 ---
 
 ## 透明被动能力（自动生效）
@@ -334,10 +367,12 @@ iframe / 状态持久化 / 认证会话 profile / 站点经验 / 宏指令 / 通
 | --- | --- |
 | Stealth 防指纹 | 自动注入 playwright-stealth（attach 模式自动禁用） |
 | 调试端口防护 | attach 模式下自建页/收养页（页级）与自建 context（context 级，覆盖弹窗）自动拦截页面脚本对本机 CDP 调试端口的 **http** 探测——常见自动化检测面，反风控；WebSocket 握手不在拦截范围 |
+| HTTP 来源校验 | 绑 127.0.0.1 之外再加三道门：回环 Host 白名单、拒绝一切带 Origin 的请求、带 body 必须 application/json——任意网页无法跨站驱动本机服务（防 CSRF / DNS rebinding），拦截记录进服务日志 |
+| 全生命周期日志 | `~/.browser-agent/logs/server.log`（2MB×7 滚动）：启动/浏览器连接/会话/命令批/空闲回收/关停/来源拦截全链路；`/status` 的 `log_file` 字段带路径 |
 | AI 自愈 Selector | 点击 Timeout 时自动尝试文字模糊匹配 |
 | 失败诊断截图 | 失败步骤自动附加截图 + possible_cause |
 | navigate 自动摘要 | 导航成功自动附加 page_summary；已积累域名附 site_experience |
-| 强制 200 响应 | 所有 HTTP 返回 200，逻辑错误通过 ok 字段区分 |
+| 强制 200 响应 | 业务端点恒返 200（成败看 ok 字段）；协议级拒绝（来源校验 403/415、关停实例门 409）用真实状态码 |
 
 ---
 
@@ -349,8 +384,12 @@ iframe / 状态持久化 / 认证会话 profile / 站点经验 / 宏指令 / 通
 - **懒加载**：提取图片 URL 前先 `scroll` 到底（或 `scroll_until_found`），未进视口
   的图可能尚未加载。
 - **视频**：`eval_js` 操控 `<video>`（时长 / seek 到任意时间点 / 播放暂停），配合
-  `screenshot` 采帧，可对视频内容离散采样分析。
-- **省 token**：元素级截图用 `clip_screenshot`，别动辄整页。
+  `screenshot` 采帧，可对视频内容离散采样分析。**seek 是异步的**：设完
+  `currentTime` 要等 `seeked` 事件再截图（`video.currentTime=t; await new
+  Promise(r=>video.onseeked=r)`），否则截到的还是上一帧。
+- **省 token**：元素级截图用 `clip_screenshot`；整页用 `screenshot` 传
+  `image_type: "jpeg"`（quality 默认 80，内容型页面比 PNG 小 3~5 倍）、
+  `scale: "css"`（高分屏机器上更小）。
 
 ## 并行调研：子 Agent 分治
 
@@ -364,6 +403,10 @@ iframe / 状态持久化 / 认证会话 profile / 站点经验 / 宏指令 / 通
   的浏览器操作真正同时执行），
 任务结束各自 `/session/stop`。需要登录态时（attach 模式）用 `context: "user"` 共享
 用户 profile。
+
+**风控节奏**：短时间内密集打开大量页面（并行批量 navigate / 批量开 tab）可能触发
+网站的反爬风控——同一站点内的批量访问保持节制（页间加延时、分批进行），跨站并行
+不受影响。
 
 | 适合分治 | 不适合分治 |
 |----------|-----------|
@@ -448,52 +491,25 @@ POST /run {"commands":[
 
 ---
 
-## 浏览器进程清理（强制）
+## 浏览器进程清理（按需兜底）
 
-测试结束后**必须**关闭浏览器实例，防止 Chrome for Testing 进程堆积占用内存。本
-skill 自带幂等清理脚本（无残留时空操作；精准匹配本服务进程 + playwright driver +
-Chrome for Testing，不误杀；attach 模式不会杀用户浏览器——它只匹配本服务自拉进程）：
+`browser-agent-cleanup` 幂等清理**本服务自拉的进程树**（server → playwright
+driver → Chromium），跨平台（macOS / Linux / Windows 同一入口）：
 
 ```bash
-browser-agent-cleanup                 # pip 安装后（console 入口，cwd 无关）
-bash browser_agent/cleanup.sh         # 仓库内直跑
+browser-agent-cleanup        # pip 安装后；仓库内直跑 python -m browser_agent.cleanup
 ```
 
-仅靠 AI 自觉清理不可靠——pytest 被 kill / 异常中断时 fixture teardown 不执行，进程就
-残留。**接入项目时应配自动兜底**，三层防御都复用上面的脚本：
+它做三重身份核对（pid 文件 → HTTP /status 身份 → 进程命令行），防 PID 复用误杀无辜
+进程；顺序是优雅关停（带 instance_id 的 /shutdown）→ 等待退出 → 进程树 SIGTERM →
+SIGKILL 兜底。**绝不按进程名全局查杀**——那会命中机器上其他项目的 Playwright、
+杀掉其他 agent 会话正在共享的本服务，attach 模式下误断连接还要用户重新授权。
 
-**① 测试 fixture teardown**（单次测试正常结束）：browser fixture `yield` 后 `client.shutdown()`
+接入建议（多任务共享服务是常态，默认**不要**在会话结束时清理）：
 
-**② pytest 兜底**（项目 `conftest.py`，覆盖异常 / 中断）——路径用 `__file__` 解析，不依赖 cwd：
-
-```python
-import atexit, contextlib, subprocess
-from pathlib import Path
-
-# browser-agent 仓库克隆位置（按实际路径调整）
-BROWSER_AGENT_REPO = Path(__file__).resolve().parents[1] / "browser-agent"
-
-def _cleanup_browser_agent() -> None:
-    script = BROWSER_AGENT_REPO / "browser_agent" / "cleanup.sh"
-    with contextlib.suppress(Exception):
-        subprocess.run(["bash", str(script)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-atexit.register(_cleanup_browser_agent)
-
-@pytest.fixture(scope="session", autouse=True)
-def _cleanup_after_session():
-    yield
-    _cleanup_browser_agent()
-```
-
-**③ Claude Code Stop hook**（`.claude/settings.json`，会话级最强兜底，覆盖测试被强杀）——用
-`$CLAUDE_PROJECT_DIR` 绝对路径（Stop hook 的 cwd 不一定是项目根）：
-
-```json
-"hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "browser-agent-cleanup", "timeout": 10 }] }] }
-```
-
-> **接入新项目（任意 AI agent 通用）**：克隆本仓库并 `pip install -e <仓库路径>`（或
-> `pip install git+<仓库地址>`），按 ②③ 接入 conftest + Stop hook 即获得自动兜底。
-> 若用裸 Playwright API（不经本服务），在 fixture teardown 显式
-> `browser.close(); playwright.stop()`。
+- **独占服务的测试场景**（该项目自己拉服务跑 E2E）：pytest conftest 里 atexit +
+  session 结束 fixture 调 `browser-agent-cleanup`，覆盖 pytest 被 kill 的残留；
+- **多会话共享服务的日常使用**：不接自动清理——服务空闲会自动回收浏览器
+  （`BROWSER_AGENT_IDLE_SHUTDOWN_SEC`），孤儿进程再手动清；
+- 若用裸 Playwright API（不经本服务），fixture teardown 显式
+  `browser.close(); playwright.stop()`。

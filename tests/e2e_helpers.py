@@ -67,6 +67,23 @@ IFRAME_PAGE = """<!doctype html><html><head><title>iframe 内部</title></head><
 <button id="if-btn" onclick="this.textContent='iframe 已点'">iframe 按钮</button>
 </body></html>"""
 
+# 多文件上传页：upload_file 数组实战验证用
+UPLOAD_PAGE = """<!doctype html><html><head><title>上传页</title></head><body>
+<input id="files" type="file" multiple>
+<input id="single" type="file">
+<div id="report"></div>
+</body></html>"""
+
+# DOM 篡改页：主世界改写 querySelectorAll（反自动化常见手法）。
+# 隔离环境（isolated world）有自己的一套 DOM 原型——eval_js isolated 应读到真实 DOM
+TAMPER_PAGE = """<!doctype html><html><head><title>篡改页</title></head><body>
+<ul id="list"><li>真实条目 A</li><li>真实条目 B</li></ul>
+<script>
+Document.prototype.querySelectorAll = function () {
+  return [{ textContent: "假条目" }];
+};
+</script></body></html>"""
+
 
 class _Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -78,6 +95,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             body = XY_PAGE
         elif self.path.startswith("/tall"):
             body = TALL_PAGE
+        elif self.path.startswith("/upload"):
+            body = UPLOAD_PAGE
+        elif self.path.startswith("/tamper"):
+            body = TAMPER_PAGE
         else:
             body = MAIN_PAGE
         data = body.encode("utf-8")
@@ -110,11 +131,16 @@ class Service:
 
     def start(self, timeout=45) -> None:
         env = dict(os.environ, BROWSER_AGENT_HOME=self.home)
+        # 独立进程组：与生产 client 拉起语义一致（终端解耦 + 可整树终止），
+        # 强杀类用例的 killpg 不会波及 pytest 自身进程组
+        kwargs = {}
+        if os.name != "nt":
+            kwargs["start_new_session"] = True
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "browser_agent.server",
              f"--port={self.port}", "--headless"] + self.extra_args,
             cwd=REPO, env=env,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs,
         )
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -140,8 +166,13 @@ class Service:
         return self.post("/run", body)
 
     def shutdown(self):
+        # 有意不复用 client.shutdown（测试骨架与被测代码保持独立），
+        # 手写同一关停协议：GET /status 取 instance_id → POST /shutdown
         try:
-            self.http.post(f"{self.base}/shutdown", json={}, timeout=10)
+            status = self.http.get(f"{self.base}/status", timeout=3).json()
+            self.http.post(f"{self.base}/shutdown",
+                           json={"instance_id": status.get("instance_id", "")},
+                           timeout=10)
         except Exception:
             pass
         if self.proc:
@@ -150,6 +181,21 @@ class Service:
             except Exception:
                 self.proc.kill()
         self.http.close()
+
+
+def run_cli(home: str, *args, port: int = None, timeout: float = 90) -> tuple:
+    """真实 CLI 子进程（agent 的实际用法）：隔离 HOME + PYTHONPATH + 仓库 cwd。
+
+    返回 (exit_code, stdout+stderr)。CLI 启动契约（环境注入/解释器/cwd）的
+    唯一实现——lifecycle 与 attach 两套 E2E 共用，不各抄一份。
+    """
+    cmd = [sys.executable, "-m", "browser_agent.client", *args]
+    if port is not None:
+        cmd.append(f"--port={port}")
+    r = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=timeout,
+        env=dict(os.environ, BROWSER_AGENT_HOME=home, PYTHONPATH=REPO), cwd=REPO)
+    return r.returncode, (r.stdout or "") + (r.stderr or "")
 
 
 def ok_step(report, idx):

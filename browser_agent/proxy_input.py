@@ -114,10 +114,18 @@ class BrowserProxyInput:
         emit({"type": "uncheck", "selector": selector, "ok": True})
         return {"ok": True}
 
-    async def upload_file(self, selector: str, file_path: str) -> dict:
-        await self._page.set_input_files(selector, file_path)
-        emit({"type": "upload_file", "selector": selector, "ok": True})
-        return {"ok": True}
+    async def upload_file(self, selector: str, files) -> dict:
+        """给 file input 设置本地文件（绕过文件对话框）。
+
+        files：单个路径字符串或路径数组（多文件上传按数组传）。"""
+        if isinstance(files, str):
+            files = [files]
+        if isinstance(files, bool) or not isinstance(files, list) or not files \
+                or not all(isinstance(f, str) and f.strip() for f in files):
+            return {"ok": False, "error": "files 需为非空文件路径或路径数组"}
+        await self._page.set_input_files(selector, files)
+        emit({"type": "upload_file", "selector": selector, "files": len(files), "ok": True})
+        return {"ok": True, "files": len(files)}
 
     # ── 鼠标/滚动 ─────────────────────────────────────────
 

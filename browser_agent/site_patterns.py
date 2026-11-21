@@ -27,6 +27,7 @@ from urllib.parse import urlparse
 import yaml
 
 from .user_data import site_patterns_dir
+from .utils import log
 
 # 域名校验：常规 hostname 字符，禁路径分隔符与穿越（纵深防御另见路径归一校验）
 _DOMAIN_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,253}[A-Za-z0-9])?$")
@@ -152,12 +153,26 @@ def list_patterns() -> dict:
     return {"ok": True, "patterns": items, "count": len(items)}
 
 
+def _matched_payload(best: dict, match_type: str) -> dict:
+    """命中结果的统一载荷（域名级与自由文本级共用一份构造）。"""
+    return {
+        "ok": True, "matched": True, "domain": best["domain"], "match_type": match_type,
+        "aliases": best["aliases"] if isinstance(best["aliases"], list) else [],
+        "updated": best["updated"],
+        "content": best["content"],
+        "ai_hint": "经验条目带日期，当作可能有效的提示而非保证；失败则回退通用模式并更新本文件",
+    }
+
+
 def match_site(target: str) -> dict:
     """按 URL/域名找最佳匹配的经验文件。
 
-    匹配优先级：**精确域名 > 子域名（a.example.com ↔ example.com）> 别名**
-    （同级中取 updated 最新）——先全表扫精确，再扫子域名，绝不因更新顺序
-    让子域文件遮蔽精确匹配。未命中时返回已知域名清单，提示 AI 顺手续写。
+    匹配优先级：**精确域名 > 子域名（a.example.com ↔ example.com）> 别名 >
+    自由文本**（入参不是合法域名——如用户原话「去小红书搜xx」——时，按
+    域名/别名在文本中的出现做子串匹配；经验在**选入口之前**就该可用，
+    而「URL 必须带 token、得从搜索进」这类先验恰恰决定入口怎么选）。
+    同级中取 updated 最新——先全表扫精确，再扫子域名，绝不因更新顺序让
+    子域文件遮蔽精确匹配。未命中时返回已知域名清单，提示 AI 顺手续写。
     """
     host = normalize_domain(target)
     if not host:
@@ -183,13 +198,26 @@ def match_site(target: str) -> dict:
     for level in ("exact", "subdomain", "alias"):
         best = _find(level)
         if best is not None:
-            return {
-                "ok": True, "matched": True, "domain": best["domain"], "match_type": level,
-                "aliases": best["aliases"] if isinstance(best["aliases"], list) else [],
-                "updated": best["updated"],
-                "content": best["content"],
-                "ai_hint": "经验条目带日期，当作可能有效的提示而非保证；失败则回退通用模式并更新本文件",
-            }
+            return _matched_payload(best, level)
+
+    # 自由文本回退：入参不是合法域名形态（含中文/空格等）时，看域名/别名
+    # 是否作为子串出现在文本里——「去小红书搜xx」→ xiaohongshu.com 经验。
+    # 域名匹配要求边界（a.co 不得命中 xa.co.cn）；别名（多为中文站名，
+    # 无词边界概念）保持纯子串
+    if validate_domain(host) is not None:
+        text = (target or "").strip().lower()
+        hits = []
+        for i in all_items:
+            aliases = [str(a).lower() for a in
+                       (i["aliases"] if isinstance(i["aliases"], list) else [])]
+            dom = i["domain"].lower()
+            dom_hit = dom in text and re.search(
+                rf"(?<![a-z0-9.-]){re.escape(dom)}(?![a-z0-9.-])", text)
+            if dom_hit or any(a in text for a in aliases):
+                hits.append(i)
+        if hits:
+            best = max(hits, key=lambda i: i.get("updated") or "")
+            return _matched_payload(best, "text")
     return {
         "ok": True, "matched": False, "domain": host,
         "known_domains": [i["domain"] for i in all_items],
@@ -284,6 +312,8 @@ def write_pattern(domain: str, aliases: Optional[list] = None,
         except OSError:
             pass
         raise
+    if appended:
+        log(f"站点经验已更新: {domain}（+{appended} 条）")
     return {"ok": True, "domain": domain, "path": path,
             "appended_entries": appended, "aliases": merged_aliases}
 

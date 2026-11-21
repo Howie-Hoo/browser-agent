@@ -8,6 +8,7 @@
 所读的机制），完整走「发现 → 偏好 → 连接 → user/isolated 会话 → 守卫 →
 断开不杀浏览器 → 重连」。不触碰用户日常 Chrome 的真实 profile。
 """
+import json
 import os
 import subprocess
 import sys
@@ -200,7 +201,7 @@ def test_disconnect_keeps_browser_and_reconnects(svc, chrome, pages):
 
 
 def test_shutdown_service_keeps_browser(svc, chrome):
-    svc.post("/shutdown", {})
+    svc.post("/shutdown", {"instance_id": svc.get("/status")["instance_id"]})
     time.sleep(1.5)
     assert chrome["proc"].poll() is None, "服务退出不得杀死用户浏览器"
 
@@ -235,7 +236,11 @@ def test_attach_dead_port_fails_with_clear_error(pages):
     try:
         r = s.post("/session/start", {"session_id": "x"})
         assert r["ok"] is False
-        assert r.get("error"), "必须有可读错误"
+        err = r.get("error", "")
+        # offline 分类：端口文件在但不在监听，错误点名成因
+        assert "未在监听" in err, err
+        # remedy 先让 agent 代开浏览器，再升级到用户开调试开关
+        assert "代开" in err and "chrome://inspect" in err
     finally:
         s.shutdown()
         cleanup_home(home)
@@ -253,3 +258,106 @@ def test_cli_attach_rejects_non_browser_dir():
     )
     assert r.returncode != 0
     assert "Local State" in (r.stdout + r.stderr)
+
+
+# ── CLI attach 成功全链路（真实可连浏览器 → 就绪等待 → 真实操作 → 退出码 0）──
+
+CLI_ATTACH_PORT = 18716
+
+
+def _cli(home, *args, timeout=90):
+    """attach 套件薄封装：固定 CLI_ATTACH_PORT（共享实现在 e2e_helpers.run_cli）。"""
+    from e2e_helpers import run_cli
+    return run_cli(home, *args, port=CLI_ATTACH_PORT, timeout=timeout)
+
+
+def test_cli_attach_success_full_chain(chrome, pages):
+    """attach 就绪等待的成功路径：`browser-agent-client attach <目录>` →
+    保存偏好 → 服务以 attach 启动 → 等浏览器真连上（退出码 0）→ 真实操作。"""
+    if not find_chrome():
+        pytest.skip("本机无可用 Chromium 系浏览器")
+    home = fresh_home("ba-attach-cli-ok-")
+    try:
+        # 1) attach 命令：保存偏好 + 启动 + 等就绪
+        code, out = _cli(home, "attach", chrome["dir"], timeout=120)
+        assert code == 0, f"期望退出码 0，实际 {code}: {out}"
+        assert "浏览器已附着 ✓" in out, out
+        # 偏好已落盘
+        pref = open(os.path.join(home, "attach.env"), encoding="utf-8").read()
+        assert chrome["dir"] in pref
+
+        # 2) 状态：attach 且浏览器在连
+        import httpx
+        c = httpx.Client(timeout=5, proxy=None)
+        st = c.get(f"http://127.0.0.1:{CLI_ATTACH_PORT}/status").json()
+        assert st["browser_mode"] == "attach" and st["browser_active"] is True
+        assert (st.get("attach") or {}).get("browser_dir") == chrome["dir"]
+        c.close()
+
+        # 3) CLI 真实操作（附着浏览器上导航本地页）
+        code, out = _cli(home, "run", json.dumps([
+            {"action": "navigate", "url": pages},
+            {"action": "get_title"},
+        ]), timeout=120)
+        assert code == 0 and "执行了 2 步" in out, out
+
+        # 4) shutdown（实例门）→ 退出码 0；Chrome 不受影响
+        code, out = _cli(home, "shutdown")
+        assert code == 0, out
+        assert chrome["proc"].poll() is None, "关服务不得杀用户浏览器"
+    finally:
+        # 兜底：测试中途失败也要关掉残留服务（Chrome 由 fixture 管）
+        import httpx
+        try:
+            c = httpx.Client(timeout=5, proxy=None)
+            st = c.get(f"http://127.0.0.1:{CLI_ATTACH_PORT}/status").json()
+            c.post(f"http://127.0.0.1:{CLI_ATTACH_PORT}/shutdown",
+                   json={"instance_id": st.get("instance_id", "")})
+            c.close()
+        except Exception:
+            pass
+        cleanup_home(home)
+
+
+def test_attach_connect_timeout_against_stalling_endpoint(pages, monkeypatch):
+    """连接等待超时可调且被遵守：假端点收下 TCP 但永不说 WebSocket →
+    connect_over_cdp 挂到 BROWSER_AGENT_CONNECT_TIMEOUT_MS 超时硬错（不静默降级）。
+    （授权弹框路径需真人点击，见手工清单；这里固化的是等待/超时机制本身。）"""
+    import socket
+    import threading
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    port = srv.getsockname()[1]
+    held = []
+
+    def _stall():
+        while True:
+            try:
+                conn, _ = srv.accept()
+                held.append(conn)
+            except OSError:
+                return
+
+    threading.Thread(target=_stall, daemon=True).start()
+    monkeypatch.setenv("BROWSER_AGENT_CONNECT_TIMEOUT_MS", "3000")
+    home = fresh_home("ba-attach-stall-")
+    s = Service(18717, home, extra_args=[
+        "--attach", f"--cdp-endpoint=ws://127.0.0.1:{port}/devtools/browser/x"])
+    s.start()
+    try:
+        t0 = time.monotonic()
+        r = s.post("/session/start", {"session_id": "stall"})
+        elapsed = time.monotonic() - t0
+        assert r["ok"] is False, "挂死端点不得连上"
+        assert "Timeout" in r.get("error", "") or "超时" in r.get("error", ""), r
+        assert elapsed < 20, f"连接超时未生效（应 ~3s 失败而非默认 120s）: {elapsed:.1f}s"
+    finally:
+        s.shutdown()
+        cleanup_home(home)
+        for c in held:
+            try:
+                c.close()
+            except Exception:
+                pass
+        srv.close()
