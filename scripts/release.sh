@@ -103,5 +103,4 @@ else
     --title "$tag — $desc" --notes-file "$tmp"
 fi
 
-gh release view "$tag" --json url,isLatest \
-  -q '"✓ 发版完成：" + .url + "（latest=" + (.isLatest|tostring) + "）"'
+gh release view "$tag" --json url -q '"✓ 发版完成：" + .url'
