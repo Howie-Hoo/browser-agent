@@ -104,6 +104,31 @@ def safe_join(root: str, name: str, ext: str, kind: str) -> str:
     return full
 
 
+def strictly_inside(child: str, parent: str) -> bool:
+    """child 是否严格位于 parent 之内（不含 parent 本身）。
+
+    全仓「文件操作入口做路径穿越校验」不变式的统一谓词
+    （browser_attach 探测边界 / local_search profile 越界键共用）。
+    跨盘等 relpath 异常按越界处理。
+    """
+    try:
+        rel = os.path.relpath(child, parent)
+    except ValueError:
+        return False
+    return (rel not in ("", ".", "..")
+            and not rel.startswith(f"..{os.sep}") and not os.path.isabs(rel))
+
+
+def read_json(path: str, default=None):
+    """容错 JSON 读取：读不到/损坏/非对象时返回 default（策略只定一次）。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return default
+    return data if isinstance(data, dict) else default
+
+
 def report_dir() -> str:
     override = os.getenv("BROWSER_AGENT_REPORT_DIR")
     if override:

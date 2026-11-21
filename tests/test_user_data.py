@@ -78,3 +78,25 @@ def test_no_legacy_sources_is_noop(isolated_home, tmp_path, monkeypatch):
     user_data.data_dir()
     assert (isolated_home / user_data.MIGRATED_MARKER).exists()
     assert not (isolated_home / "profiles").exists()
+
+
+# ── pid 文件落位（运行态不写包目录）─────────────────────────
+
+def test_legacy_pid_file_removed_once(isolated_home, monkeypatch, tmp_path):
+    """包目录里的旧 pid 文件在首次 data_dir() 时被清理，且只查一次。"""
+    legacy = tmp_path / "browser_agent.pid"
+    legacy.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(user_data, "_LEGACY_PID_FILE", str(legacy))
+    monkeypatch.setattr(user_data, "_legacy_pid_checked", False)
+    user_data.data_dir()
+    assert not legacy.exists()
+    # 二次调用不再探测：重新放一个文件不会被删
+    legacy.write_text("{}", encoding="utf-8")
+    user_data.data_dir()
+    assert legacy.exists()
+
+
+def test_pid_file_respects_isolated_home(isolated_home):
+    """pid_file() 惰性求值——只在调用时才解析（且跟随 BROWSER_AGENT_HOME）。"""
+    path = user_data.pid_file()
+    assert path.startswith(str(isolated_home))

@@ -49,6 +49,12 @@ class BrowserProxyTabs:
             context_args["record_har_path"] = self.record_har_path
         context = await self._browser.new_context(**context_args)
         self._contexts[name] = context
+        # attach 模式下自建 context 整体挂端口防护：弹窗（window.open）与
+        # 该 context 的后续页全覆盖（用户 default context 不做 context 级
+        # 挂载——不改动用户浏览环境的网络行为，只做自建页页级挂载）
+        if self._attached_port:
+            await self._guard_debug_port(context)
+            self._guarded_contexts.add(context)
         await self._register_page(context, name)
         if profile:
             self._set_active_profile(profile)
@@ -85,13 +91,17 @@ class BrowserProxyTabs:
 
     async def _unregister_page(self, key: str, close: bool) -> None:
         """注销一个已注册页面。close=False 或页面属于用户（adopt_tab 收养）时
-        只取消注册、绝不关闭浏览器里的页——最小侵入契约的唯一实现点。"""
+        只取消注册、绝不关闭浏览器里的页——最小侵入契约的唯一实现点；
+        收养页注销时同步撤销我们装上的端口防护路由，不留残余拦截。"""
+        was_adopted = key in self._adopted_tabs
         page = self._pages.pop(key, None)
-        if page is not None and close and key not in self._adopted_tabs:
+        if page is not None and close and not was_adopted:
             try:
                 await page.close()
             except Exception:
                 pass
+        if page is not None and was_adopted:
+            await self._unguard_debug_port(page)
         self._adopted_tabs.discard(key)
         self._purge_tab_state(key)
 
@@ -181,9 +191,9 @@ class BrowserProxyTabs:
         key = name or f"user-tab-{index}"
         if key in self._pages:
             return {"ok": False, "error": f"键 '{key}' 已被占用，换一个 name"}
-        self._pages[key] = page
         self._adopted_tabs.add(key)
-        self._set_current_tab(key)
+        # 收养走统一注册咽喉（活动时间/端口防护与自建页同一套不变式）
+        await self._register_existing_page(key, page)
         if activate:
             try:
                 await page.bring_to_front()

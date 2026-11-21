@@ -21,34 +21,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 pytestmark = pytest.mark.skipif(not os.getenv("RUN_E2E"), reason="需要 RUN_E2E=1（真实浏览器）")
 
 from e2e_helpers import (Service, fresh_home, cleanup_home, start_page_server,  # noqa: E402
-                         ok_step, wait_active_batches)
-
-CHROME_CANDIDATES = [
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "/Applications/Chromium.app/Contents/MacOS/Chromium",
-    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-]
-
-
-def find_chrome() -> str:
-    for p in CHROME_CANDIDATES:
-        if os.path.isfile(p):
-            return p
-    return ""
-
-
-def wait_devtools_port(profile_dir: str, timeout=25) -> int:
-    """轮询等待 Chrome 写出 DevToolsActivePort（解析复用 browser_attach）。"""
-    from browser_agent import browser_attach as ba
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        port = ba.read_devtools_port(profile_dir)
-        if port is not None:
-            return port
-        time.sleep(0.3)
-    raise RuntimeError("Chrome 未在超时内写出 DevToolsActivePort")
-
+                         ok_step, wait_active_batches, find_chrome, wait_devtools_port,
+                         spawn_chrome, stop_chrome)
 
 @pytest.fixture(scope="module")
 def pages():
@@ -60,22 +34,11 @@ def pages():
 @pytest.fixture(scope="module")
 def chrome():
     """临时 profile 的真实 Chrome（自管端口，DevToolsActivePort 落在 profile 目录）。"""
-    binary = find_chrome()
-    if not binary:
+    if not find_chrome():
         pytest.skip("本机无可用 Chromium 系浏览器")
-    profile = tempfile.mkdtemp(prefix="ba-attach-profile-")
-    proc = subprocess.Popen([
-        binary, "--headless=new", "--remote-debugging-port=0",
-        f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check",
-        "about:blank",
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    port = wait_devtools_port(profile)
-    yield {"proc": proc, "dir": profile, "port": port}
-    proc.terminate()
-    try:
-        proc.wait(timeout=10)
-    except Exception:
-        proc.kill()
+    c = spawn_chrome("ba-attach-profile-")
+    yield c
+    stop_chrome(c)
 
 
 @pytest.fixture(scope="module")

@@ -5,6 +5,7 @@
 运行：pytest tests/test_server_sessions.py -q
 """
 import asyncio
+import json
 import os
 import sys
 import time
@@ -439,3 +440,148 @@ def test_close_user_session_closes_own_pages_only():
     # default 会话与页面完好
     assert "default" in state.proxy._pages
     assert state.switch_to_session(DEFAULT_SESSION)
+
+
+# ── 关停维护态（排水拒绝新批）──────────────────────────────
+
+class _FakeReq:
+    has_body = False
+    path = "/run"
+    method = "POST"
+
+    async def json(self):
+        return {}
+
+
+def test_shutdown_sets_maintenance_flag(monkeypatch):
+    s = AppState()
+    monkeypatch.setattr(browser_server, "_state", s)
+    resp = asyncio.run(browser_server.handle_shutdown(_FakeReq()))
+    body = json.loads(resp.text)
+    assert body["ok"] is True
+    assert s.maintenance is True
+
+
+def test_run_refused_while_maintaining(monkeypatch):
+    """维护拒绝由中间件统一实施——经中间件调用 handler 验证。"""
+    s = AppState()
+    s.maintenance = True
+    monkeypatch.setattr(browser_server, "_state", s)
+    resp = asyncio.run(browser_server._maintenance_middleware(
+        _FakeReq(), browser_server.handle_run))
+    body = json.loads(resp.text)
+    assert body["ok"] is False and body["maintenance"] is True
+    assert "关停" in body["error"]
+
+
+def test_maintenance_open_routes_still_served(monkeypatch):
+    """白名单路由（/status /sites 等）在维护期照常应答。"""
+    s = AppState()
+    s.maintenance = True
+    monkeypatch.setattr(browser_server, "_state", s)
+    for path in ("/status", "/sites", "/macro/list", "/attach/discover"):
+        req = _FakeReq()
+        req.path = path
+        served = {}
+
+        async def _handler(request):
+            served["hit"] = True
+            return browser_server._json({"ok": True})
+
+        asyncio.run(browser_server._maintenance_middleware(req, _handler))
+        assert served.get("hit") is True, path
+
+
+# ── 页级空闲回收 ───────────────────────────────────────────
+
+class _LiveBrowser:
+    def is_connected(self):
+        return True
+
+
+def _proxy_with_pages(pages: dict, adopted: set, times: dict):
+    """真实 BrowserProxy + 假页面（close_idle_tabs / _unregister_page 是真实现）。"""
+    from browser_agent.proxy import BrowserProxy
+    p = BrowserProxy()
+    p._browser = _LiveBrowser()
+    ctx = FakeContext("c")
+    for key in pages:
+        p._pages[key] = pages[key] or FakePage(ctx)
+    p._adopted_tabs = set(adopted)
+    p._tab_last_used = dict(times)
+    return p
+
+
+def test_close_idle_tabs_closes_stale_self_created_only():
+    now = time.monotonic()
+    p = _proxy_with_pages(
+        pages={"a": None, "b": None, "c": None},
+        adopted={"c"},
+        times={"a": now, "b": now - 999})
+    p._page_registered_at = {"c": now - 999}
+    closed = asyncio.run(p.close_idle_tabs(100, protected={"a"}))
+    assert closed == ["b"]
+    assert "b" not in p._pages and "a" in p._pages and "c" in p._pages
+    assert "b" not in p._tab_last_used  # 运行态随页清理
+
+
+def test_recycle_idle_tabs_uses_session_active_tabs_as_protected(monkeypatch):
+    from browser_agent.server import Session
+    monkeypatch.setattr(browser_server, "TAB_IDLE_SEC", 60)
+    now = time.monotonic()
+    p = _proxy_with_pages(
+        pages={"s1::extra": None, "s1::t1": None, "user-tab": None},
+        adopted={"user-tab"},
+        times={"s1::extra": now - 999, "s1::t1": now, "user-tab": now})
+    s = AppState()
+    s.proxy = p
+    s.sessions = {"s1": Session("s1", tab="s1::t1")}
+    closed = asyncio.run(s.recycle_idle_tabs())
+    assert closed == ["s1::extra"]
+
+
+def test_recycle_idle_tabs_disabled_by_zero(monkeypatch):
+    monkeypatch.setattr(browser_server, "TAB_IDLE_SEC", 0)
+    now = time.monotonic()
+    p = _proxy_with_pages(pages={"b": None}, adopted=set(), times={"b": now - 9999})
+    s = AppState()
+    s.proxy = p
+    assert asyncio.run(s.recycle_idle_tabs()) == []
+
+
+def test_recycle_idle_tabs_skips_inflight_session_pages(monkeypatch):
+    """锁被持有（批在途）的会话名下页面整组跳过——批中途 switch_tab 的
+    目标页要等批结束才回写 active_tab，期间不能被回收（并发竞态守卫）。"""
+    from browser_agent.server import Session
+    monkeypatch.setattr(browser_server, "TAB_IDLE_SEC", 60)
+    now = time.monotonic()
+    p = _proxy_with_pages(pages={"s2::stale": None, "s2": None},
+                          adopted=set(),
+                          times={"s2::stale": now - 999, "s2": now - 999})
+    s = AppState()
+    s.proxy = p
+    s.sessions = {"s2": Session("s2", tab="s2::other")}
+    lock = s.session_lock("s2")
+    asyncio.run(lock.acquire())  # 模拟在途批持锁
+    try:
+        # 由别的会话触发：在途会话的页（含裸 sid 初始页）全部受保护
+        assert asyncio.run(s.recycle_idle_tabs(exclude_sid="s1")) == []
+        # 在途会话自身触发（刚完成 active_tab 回写）：不受自持锁误跳过
+        assert asyncio.run(s.recycle_idle_tabs(exclude_sid="s2")) == ["s2::stale", "s2"]
+    finally:
+        lock.release()
+
+
+def test_maintenance_refuses_refresh_stop_and_auth_profiles(monkeypatch):
+    """维护中间件覆盖会话变更类入口：refresh（防排水中清库+auto_save 落盘空态）、
+    stop（防与关停并发 stop）、auth/profiles（防排水期拉起浏览器）。"""
+    s = AppState()
+    s.maintenance = True
+    monkeypatch.setattr(browser_server, "_state", s)
+    for handler in (browser_server.handle_session_refresh,
+                    browser_server.handle_session_stop,
+                    browser_server.handle_auth_profiles):
+        resp = asyncio.run(browser_server._maintenance_middleware(
+            _FakeReq(), handler))
+        body = json.loads(resp.text)
+        assert body["ok"] is False and body["maintenance"] is True, handler

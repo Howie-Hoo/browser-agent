@@ -19,6 +19,7 @@
 | 命令 | 参数 | 说明 |
 | --- | --- | --- |
 | `click` | `selector`, `button`, `click_count` | CSS 选择器精确点击（底层，永远可用） |
+| `click_xy` | `x`, `y`, `button`, `click_count`, `delay` | 按视口坐标真实鼠标点击（move → down → up）；canvas/地图/视频/滑块等无 selector 目标，坐标取 `get_bounding_box` 中心，命中与否需事后核对 |
 | `click_text` | `text`, `exact` | 按文字内容点击 |
 | `click_by_id` | `id`(数字) | 按 get_annotated_dom 序号点击 |
 | `find_and_act` | `description`, `act`, `value` | 语义匹配（无需 selector） |
@@ -126,13 +127,25 @@ profile 机制与项目接入写法见 [`SKILL.md`](../SKILL.md)「认证会话�
 
 `navigate` 到已积累的域名时，响应自动附 `site_experience` 提示（domain/match_type/updated）。
 
+### 本地浏览器资源检索
+
+从本机 Chromium 系浏览器的**书签 / 历史**检索 URL（公网搜不到的内部系统、之前看过的页面）。
+纯本地只读操作（历史库复制到临时文件后只读查询），不触碰浏览器进程、无需服务在运行。
+
+| 命令 | 参数 | 说明 |
+| --- | --- | --- |
+| `search_local` | `keywords`, `only?`, `browser?`, `limit?`, `since?`, `sort?` | 多词 AND 匹配标题+URL；`only=bookmarks\|history`；`browser` 限定浏览器名；`since=1d\|7h\|30m\|YYYY-MM-DD`（仅历史）；`sort=recent\|visits`；`limit` 0=不限。书签无关键词时不检索 |
+
+CLI 等价：`browser-agent-client find-url [关键词…] [--only …] [--browser …] [--limit N] [--since …] [--sort …]`
+
 ### 其他
 
 | 命令 | 参数 | 说明 |
 | --- | --- | --- |
 | `eval_js` | `script`, `selector` | 执行 JS（底层万能工具） |
 | `hover` / `hover_submenu` | `selector` | 鼠标悬停 |
-| `scroll` / `scroll_to_element` / `scroll_until_found` | — | 滚动操作 |
+| `scroll` / `scroll_to_element` / `scroll_until_found` | `scroll` 另有 `direction=top\|bottom` | 滚动操作；direction 直接滚到页面顶/底（scrollHeight，触发懒加载） |
+| `upload_file` | `selector`, `file_path` | 给 file input 设置本地文件（绕过文件对话框） |
 | `drag_and_drop` / `drag_drop` | `source`, `target` | 拖拽操作 |
 | `detect_captcha` | — | 探测验证码 |
 | `get_page_health` | — | JS 错误/资源失败/性能指标 |
@@ -158,7 +171,8 @@ profile 机制与项目接入写法见 [`SKILL.md`](../SKILL.md)「认证会话�
 ## HTTP API
 
 ```text
-GET  /status          健康检查（含 browser_mode / site_patterns 列表 / user_data_dir）
+GET  /status          健康检查（含 browser_mode / site_patterns 列表 / user_data_dir /
+                      instance_id / pid / started_at / revision / maintenance / tab_idle_sec）
 POST /session/start   启动/重配会话（context: "isolated" | "user"）
 POST /session/reset   重置页面
 POST /session/refresh 清除当前会话 cookies + storage（共享用户上下文中拒绝执行）
@@ -168,7 +182,7 @@ POST /check           预设检验套件
 GET  /sites           站点经验列表
 GET  /site            读取站点经验（?domain= 或 ?url=，支持子域名/别名匹配）
 POST /site            追加站点经验 {domain, aliases?, platform?, patterns?, pitfalls?}
-GET  /attach/discover 列出可附着的本机浏览器（含远程调试开关状态）
+GET  /attach/discover 列出可附着的本机浏览器（含远程调试开关状态 + 应用数据根目录文件夹名）
 POST /attach/select   保存附着偏好 {attach_dir | cdp_endpoint | forget}（重启服务后生效）
 POST /macro/save      保存宏
 POST /macro/run       运行宏
@@ -176,7 +190,22 @@ GET  /macro/list      列出宏
 GET  /auth/profiles   列出所有 profile 元数据（不含 token 内容）
 POST /auth/ensure     确保已登录：{profile, login_commands, into} — 失效则执行登录命令并落盘
 GET  /stream          SSE 实时推送
-POST /shutdown        优雅关闭（浏览器 + HTTP 服务；attach 模式用户浏览器保持运行）
+POST /shutdown        优雅关闭（浏览器 + HTTP 服务；attach 模式用户浏览器保持运行）；
+                      触发即进入 maintenance——排水期间 /run /session/start|reset|refresh|stop
+                      /check /auth/ensure /auth/profiles /macro/run 拒绝新请求
+                      （ok=false + maintenance=true）；/status /sites /macro/list /attach/* 仍可用
 ```
 
 所有端点恒返 200，逻辑成败看响应体 `ok` 字段。
+
+`/status` 的服务实例字段：`instance_id`（进程内 UUID）+ `pid` + `started_at` 用于确认
+连的是同一个实例；`revision` 是核心源码指纹——升级代码后旧服务仍在跑可被识别
+（升级需重启服务生效）。
+
+CLI 补充：
+
+```text
+browser-agent-client find-url [关键词…] [--only bookmarks|history] [--browser <名>]
+                               [--limit N] [--since 1d|7h|YYYY-MM-DD] [--sort recent|visits]
+browser-agent-client attach --probe <应用数据根目录下的文件夹>   # 清单外浏览器受控探测
+```

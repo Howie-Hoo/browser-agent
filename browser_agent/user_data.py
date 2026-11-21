@@ -28,6 +28,9 @@ _LEGACY_PKG_STORAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 _LEGACY_REPO_STORAGE = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "storage")
 )
+# 旧版把 pid 文件写在包目录——运行态必须落用户目录，顺手清掉旧文件
+_LEGACY_PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser_agent.pid")
+_legacy_pid_checked = False
 
 
 def data_dir() -> str:
@@ -53,6 +56,13 @@ def downloads_dir() -> str:
 
 def state_file() -> str:
     return os.path.join(data_dir(), "state.json")
+
+
+def pid_file() -> str:
+    """服务 pid 文件（运行态与用户数据同落 ~/.browser-agent/——永不写包目录，
+    pip 重装不留 stale pid）。惰性语义由 data_dir() 保证：只在调用时解析，
+    import 期不触碰用户目录（测试的 BROWSER_AGENT_HOME 隔离晚于模块导入）。"""
+    return os.path.join(data_dir(), "browser_agent.pid")
 
 
 def cookies_file() -> str:
@@ -105,7 +115,20 @@ def _migrate_legacy(root: str) -> list:
     return moved
 
 
+def _remove_legacy_pid_once() -> None:
+    """清理包目录里的旧 pid 文件（新位置在用户数据目录；每次进程只查一次）。"""
+    global _legacy_pid_checked
+    if _legacy_pid_checked:
+        return
+    _legacy_pid_checked = True
+    try:
+        os.remove(_LEGACY_PID_FILE)
+    except OSError:
+        pass
+
+
 def _ensure(root: str) -> None:
+    _remove_legacy_pid_once()
     marker = os.path.join(root, MIGRATED_MARKER)
     if os.path.exists(marker):
         return

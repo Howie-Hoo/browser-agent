@@ -14,6 +14,7 @@ import base64
 import contextvars
 import os
 import sys
+import time
 from typing import Optional
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -23,13 +24,16 @@ if hasattr(sys.stderr, "reconfigure"):
 
 from .utils import log, emit
 from .proxy_ai import BrowserProxyAI
+from .proxy_input import BrowserProxyInput
 from .proxy_tabs import BrowserProxyTabs
 from .proxy_auth import BrowserProxyAuth
 from .site_patterns import BrowserProxySites
+from .local_search import BrowserProxyLocalSearch
 from . import user_data
 
 
-class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth, BrowserProxySites):
+class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth,
+                   BrowserProxySites, BrowserProxyLocalSearch, BrowserProxyInput):
     """Playwright 浏览器操作封装，由服务端持久托管。
 
     两种模式：
@@ -100,6 +104,12 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth, BrowserPr
         # 共享则绝不 close 该 context、不抢焦点、不清 storage
         self._shared_default_context = False
         self._attach_info: dict = {}
+        # attach：本连接的 CDP 调试端口（页面级端口防护用；managed 模式为 None）
+        self._attached_port: Optional[int] = None
+        # 已挂 context 级端口防护的自建 context（页级挂载据此跳过，防重复注册）
+        self._guarded_contexts: set = set()
+        # 标签页空闲回收用的活动时间（monotonic）：批入口/切页两个路由写入点刷新
+        self._tab_last_used: dict = {}
 
     # ── 标签页上下文（并发模型核心）──────────────────────
     # 键约定唯一属主："sid::name"。server 与 proxy 都只经这一对函数拼/拆。
@@ -123,6 +133,8 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth, BrowserPr
         """命令批入口：为本任务装上带 sid 的路由上下文（唯一合法写入点）。"""
         self._current_tab.set({"tab": tab, "sid": sid})
         self._active_tab = tab
+        # 标签页空闲回收的活动信号：批到达即视为该页活跃
+        self._tab_last_used[tab] = time.monotonic()
 
     def _router_sid(self) -> Optional[str]:
         """当前批所属会话（server 在批入口写入 router；守卫钩子用）。"""
@@ -144,6 +156,9 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth, BrowserPr
             self._current_tab.set(router)
         router["tab"] = key
         self._active_tab = key
+        # 切页即刷新活动时间：批中途 switch_tab 的目标页不能被当成陈旧页回收
+        # （Session.active_tab 要到批结束才回写，期间全靠这里的触碰保活）
+        self._tab_last_used[key] = time.monotonic()
 
     def _purge_tab_state(self, key: str) -> None:
         """清理某标签页键关联的全部运行态（页已关闭时调用）。"""
@@ -153,6 +168,7 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth, BrowserPr
         self._failed_requests.pop(key, None)
         self._element_caches.pop(key, None)
         self._active_profiles.pop(key, None)
+        self._tab_last_used.pop(key, None)
 
     def _cache_invalidate(self) -> None:
         """清除当前标签页的元素缓存（改变页面状态的操作后调用）。"""
@@ -190,6 +206,48 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth, BrowserPr
         from playwright_stealth import Stealth
         await Stealth().apply_stealth_async(page)
 
+    def _debug_port_patterns(self) -> list:
+        """端口防护的拦截模式（无端口 → 空表）。只拦 http 探测；WebSocket
+        握手不经 page.route，不在拦截范围（文档已注明）。"""
+        port = self._attached_port
+        return [f"http://127.0.0.1:{port}/**", f"http://localhost:{port}/**"] if port else []
+
+    async def _guard_debug_port(self, target) -> None:
+        """attach 端口防护：拦截页面脚本对本机 CDP 调试端口的探测（反风控）。
+
+        页面可用 fetch 127.0.0.1:{调试端口} 探测浏览器是否开着自动化接口，
+        这是常见的自动化检测面。只拦本连接的端口，不影响其他本地服务；
+        挂载失败不阻断建页（防护尽力而为）。managed 模式无端口暴露，不调用。
+        target 为 Page 或自建 Context——context 级挂载可覆盖弹窗与其后续页。
+        """
+        if not self._attached_port:
+            return
+
+        async def _abort(route) -> None:
+            try:
+                await route.abort()
+            except Exception:
+                pass
+
+        for pattern in self._debug_port_patterns():
+            try:
+                await target.route(pattern, _abort)
+            except Exception as e:
+                log(f"⚠️ 调试端口防护未挂载（{pattern}）: {e}")
+
+    async def _unguard_debug_port(self, page) -> None:
+        """撤销页面上的端口防护路由（收养结束时调用——最小侵入不留残余拦截）。
+
+        unroute(模式) 移除该模式全部 handler；页面从未挂过时静默。
+        """
+        if not self._attached_port:
+            return
+        for pattern in self._debug_port_patterns():
+            try:
+                await page.unroute(pattern)
+            except Exception:
+                pass
+
     async def _register_page(self, context, key: str, label: str = ""):
         """在指定 context 建页并注册：stealth / 超时 / 崩溃与下载监听统一在此。
 
@@ -200,10 +258,24 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth, BrowserPr
         page.set_default_timeout(self.default_timeout)
         page.on("crash", lambda p: log(f"⚠️ 页面 '{label or key}' 崩溃！状态已失效"))
         page.on("download", self._on_download)
-        self._pages[key] = page
-        self._set_current_tab(key)
-        self._setup_health_listeners(page, key)
+        await self._register_existing_page(key, page, health_listeners=True)
         return page
+
+    async def _register_existing_page(self, key: str, page,
+                                      health_listeners: bool = False) -> None:
+        """把已存在的页纳入服务管理——建页与 adopt_tab 收养的**唯一注册咽喉**：
+        注册、切换操作目标（顺带刷新活动时间）、健康监听、端口防护。
+
+        端口防护挂页级，但所在 context 已整体挂过（自建 context）则跳过——
+        同一套模式重复注册只是死代码加一次 CDP 往返。
+        """
+        self._pages[key] = page
+        if health_listeners:
+            self._setup_health_listeners(page, key)
+        self._set_current_tab(key)  # 切页即刷新 _tab_last_used（无需再显式 touch）
+        if self._attached_port and \
+                getattr(page, "context", None) not in self._guarded_contexts:
+            await self._guard_debug_port(page)
 
     async def start(self) -> None:
         from playwright.async_api import async_playwright
@@ -217,6 +289,10 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth, BrowserPr
         self._browser.on("disconnected", lambda browser: log("⚠️ 浏览器连接断开！"))
         await self._register_page(context, "default", label="default")
         if self.mode == "attach":
+            # 完整启动成功（默认页注册完毕）才落 pin：半启动失败不留幽灵 pin，
+            # 否则会把用户重试时换到正确浏览器的第一次连接也挡掉
+            from .browser_attach import attach_identity, set_pinned_dir
+            set_pinned_dir(attach_identity(self._attach_info))
             log(f"已附着用户浏览器 [{'无头' if self.headless else '有头'}] "
                 f"{self._attach_info.get('browser_dir') or self._attach_info.get('endpoint')}")
         else:
@@ -254,10 +330,18 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth, BrowserPr
 
     async def _start_attached(self) -> None:
         """CDP 附着用户日常浏览器（硬错不降级，契约见 browser_attach 模块头）。"""
-        from .browser_attach import resolve_endpoint, format_attach_error
+        from .browser_attach import (resolve_endpoint, format_attach_error,
+                                     attach_identity, pin_mismatch_error,
+                                     endpoint_port)
         info = resolve_endpoint(self.attach_dir, self.cdp_endpoint)
         if not info.get("ok"):
             raise RuntimeError(format_attach_error(info))
+        # 进程级身份 pin：本进程已附着过别的浏览器/端点 → 硬错（不静默换目标）。
+        # 身份令牌含端点直连（目录与端点两种身份不互通）
+        identity = attach_identity(info)
+        pin_err = pin_mismatch_error(identity)
+        if pin_err:
+            raise RuntimeError(pin_err)
         # 连接超时给足用户在浏览器里点「允许」的时间（Chrome 新式开关每条新连接
         # 都要授权一次；Playwright 默认 30s 太短，用户来不及点「允许」）。
         # BROWSER_AGENT_CONNECT_TIMEOUT_MS 可调。
@@ -271,11 +355,13 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth, BrowserPr
         # 有既有 context = 用户真实 profile（登录态即来自它）→ 共享，只加页不关它
         self._shared_default_context = bool(contexts)
         self._contexts["default"] = contexts[0] if contexts else await self._browser.new_context()
+        self._attached_port = endpoint_port(info["endpoint"])
         self._attach_info = {
             "endpoint": info["endpoint"],
             "browser_dir": info.get("browser_dir"),
             "browser_version": self._browser.version,
             "source": info.get("source"),
+            "debug_port": self._attached_port,
         }
 
     async def stop(self) -> None:
@@ -296,6 +382,33 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth, BrowserPr
         if self._playwright:
             await self._playwright.stop()
         log("已断开浏览器连接（用户浏览器保持运行）" if self._shared_default_context else "浏览器已关闭")
+
+    async def close_idle_tabs(self, idle_sec: float, protected: set) -> list:
+        """关闭超时无活动的**自建**标签页（收养页与 protected 集合除外）。
+
+        protected 由 server 传入各会话的 active_tab——活跃操作目标永不回收；
+        页面整体生命周期归 /session/stop 与全局空闲回收管，这里只做页级兜底
+        （长会话开一堆 tab 只用其一的场景）。
+        """
+        now = time.monotonic()
+        closed = []
+        for key in list(self._pages):
+            if key in self._adopted_tabs or key in protected:
+                continue
+            # 显式判空：monotonic 时间戳理论可为 0.0（falsy，不能用 or 链）
+            last = self._tab_last_used.get(key)
+            if last is None:
+                last = now
+            if now - last < idle_sec:
+                continue
+            try:
+                await self._unregister_page(key, close=True)
+                closed.append(key)
+            except Exception as e:
+                log(f"标签页空闲回收失败（{key}）: {e}")
+        if closed:
+            log(f"标签页空闲回收（>{int(idle_sec)}s 无活动）：{closed}")
+        return closed
 
     @property
     def current_url(self) -> str:
@@ -388,106 +501,6 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth, BrowserPr
         emit({"type": "screenshot", "base64": b64})
         return {"base64": b64}
 
-    # ── 点击 ──────────────────────────────────────────────
-
-    async def click(self, selector: str, button: str = "left", click_count: int = 1,
-                    delay: int = 0, position: Optional[dict] = None) -> dict:
-        kw = {"button": button, "click_count": click_count, "delay": delay}
-        if position:
-            kw["position"] = position
-        await self._page.click(selector, **kw)
-        emit({"type": "click", "selector": selector, "ok": True})
-        return {"ok": True}
-
-    async def click_text(self, text: str, exact: bool = False) -> dict:
-        sel = f"text='{text}'" if exact else f"text={text}"
-        await self._page.click(sel)
-        emit({"type": "click_text", "text": text, "ok": True})
-        return {"ok": True}
-
-    async def click_nth(self, selector: str, index: int = 0) -> dict:
-        await self._page.locator(selector).nth(index).click()
-        emit({"type": "click_nth", "selector": selector, "index": index, "ok": True})
-        return {"ok": True}
-
-    # ── 输入 ──────────────────────────────────────────────
-
-    async def type_text(self, selector: str, text: str, clear_first: bool = True, delay: int = 0) -> dict:
-        if clear_first:
-            await self._page.fill(selector, "")
-        await self._page.type(selector, text, delay=delay)
-        emit({"type": "type", "selector": selector, "ok": True})
-        return {"ok": True}
-
-    async def fill(self, selector: str, value: str) -> dict:
-        await self._page.fill(selector, value)
-        emit({"type": "fill", "selector": selector, "ok": True})
-        return {"ok": True}
-
-    async def press_key(self, key: str, selector: Optional[str] = None) -> dict:
-        if selector:
-            await self._page.press(selector, key)
-        else:
-            await self._page.keyboard.press(key)
-        emit({"type": "press_key", "key": key, "ok": True})
-        return {"ok": True}
-
-    async def clear(self, selector: str) -> dict:
-        await self._page.fill(selector, "")
-        emit({"type": "clear", "selector": selector, "ok": True})
-        return {"ok": True}
-
-    # ── 表单 ──────────────────────────────────────────────
-
-    async def select_option(self, selector: str, value: Optional[str] = None,
-                            label: Optional[str] = None, index: Optional[int] = None) -> dict:
-        kw = {}
-        if value is not None: kw["value"] = value
-        elif label is not None: kw["label"] = label
-        elif index is not None: kw["index"] = index
-        selected = await self._page.select_option(selector, **kw)
-        emit({"type": "select", "selector": selector, "selected": selected, "ok": True})
-        return {"selected": selected}
-
-    async def check(self, selector: str, force: bool = False) -> dict:
-        await self._page.check(selector, force=force)
-        emit({"type": "check", "selector": selector, "ok": True})
-        return {"ok": True}
-
-    async def uncheck(self, selector: str) -> dict:
-        await self._page.uncheck(selector)
-        emit({"type": "uncheck", "selector": selector, "ok": True})
-        return {"ok": True}
-
-    async def upload_file(self, selector: str, file_path: str) -> dict:
-        await self._page.set_input_files(selector, file_path)
-        emit({"type": "upload_file", "selector": selector, "ok": True})
-        return {"ok": True}
-
-    # ── 鼠标/滚动 ─────────────────────────────────────────
-
-    async def hover(self, selector: str) -> dict:
-        await self._page.hover(selector)
-        emit({"type": "hover", "selector": selector, "ok": True})
-        return {"ok": True}
-
-    async def scroll(self, selector: Optional[str] = None, x: int = 0, y: int = 500) -> dict:
-        if selector:
-            await self._page.locator(selector).evaluate(f"el => el.scrollBy({x}, {y})")
-        else:
-            await self._page.evaluate(f"window.scrollBy({x}, {y})")
-        emit({"type": "scroll", "ok": True})
-        return {"ok": True}
-
-    async def scroll_to_element(self, selector: str) -> dict:
-        await self._page.locator(selector).scroll_into_view_if_needed()
-        emit({"type": "scroll_to_element", "selector": selector, "ok": True})
-        return {"ok": True}
-
-    async def drag_and_drop(self, source: str, target: str) -> dict:
-        await self._page.drag_and_drop(source, target)
-        emit({"type": "drag_and_drop", "ok": True})
-        return {"ok": True}
 
     # ── 等待 ──────────────────────────────────────────────
 
@@ -640,6 +653,8 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth, BrowserPr
                                                          p.get("selector"), p.get("clip"), p.get("return_base64", False)),
             "click":             lambda: self.click(p["selector"], p.get("button", "left"),
                                                     p.get("click_count", 1), p.get("delay", 0), p.get("position")),
+            "click_xy":          lambda: self.click_xy(p["x"], p["y"], p.get("button", "left"),
+                                                       p.get("click_count", 1), p.get("delay", 0)),
             "click_text":        lambda: self.click_text(p["text"], p.get("exact", False)),
             "click_nth":         lambda: self.click_nth(p["selector"], p.get("index", 0)),
             "type":              lambda: self.type_text(p["selector"], p["text"], p.get("clear_first", True), p.get("delay", 0)),
@@ -651,7 +666,8 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth, BrowserPr
             "uncheck":           lambda: self.uncheck(p["selector"]),
             "upload_file":       lambda: self.upload_file(p["selector"], p["file_path"]),
             "hover":             lambda: self.hover(p["selector"]),
-            "scroll":            lambda: self.scroll(p.get("selector"), p.get("x", 0), p.get("y", 500)),
+            "scroll":            lambda: self.scroll(p.get("selector"), p.get("x", 0), p.get("y", 500),
+                                                     p.get("direction")),
             "scroll_to_element": lambda: self.scroll_to_element(p["selector"]),
             "drag_and_drop":     lambda: self.drag_and_drop(p["source"], p["target"]),
             "wait_for":          lambda: self.wait_for(p["selector"], p.get("state", "visible"), p.get("timeout")),
@@ -693,6 +709,11 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth, BrowserPr
             "read_site":         lambda: self.read_site(p.get("domain") or p.get("url")),
             "write_site":        lambda: self.write_site(p["domain"], p.get("aliases"), p.get("platform"), p.get("patterns"), p.get("pitfalls")),
             "delete_site":       lambda: self.delete_site(p["domain"]),
+            # 本地浏览器资源检索（来自 BrowserProxyLocalSearch mixin；纯文件操作）
+            "search_local":      lambda: self.search_local(p.get("keywords", p.get("keyword")),
+                                                           p.get("only"), p.get("browser"),
+                                                           p.get("limit", 20), p.get("since"),
+                                                           p.get("sort", "recent")),
             # 认证会话（来自 BrowserProxyAuth mixin）
             "save_profile":      lambda: self.save_profile(p["name"], p.get("include_auth", True)),
             "load_profile":      lambda: self.load_profile(p["name"], p.get("into", "new"), p.get("navigate", True)),
@@ -742,7 +763,7 @@ class BrowserProxy(BrowserProxyAI, BrowserProxyTabs, BrowserProxyAuth, BrowserPr
                 res["success"] = res.get("success", res.get("ok", True))
             # O3: 缓存失效 — 改变页面状态的操作后清除元素缓存
             _CACHE_INVALIDATING_ACTIONS = {
-                "navigate", "click", "click_text", "click_nth", "fill", "type",
+                "navigate", "click", "click_xy", "click_text", "click_nth", "fill", "type",
                 "select", "check", "uncheck", "scroll", "scroll_to_element",
                 "reload", "switch_tab", "switch_frame", "switch_to_main_frame",
                 "new_tab", "drag_and_drop", "drag_drop", "hover", "load_profile",

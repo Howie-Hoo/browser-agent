@@ -23,7 +23,9 @@
   # pip 安装后等价：browser-agent-server [--port=7788] ...
 """
 import asyncio
+import hashlib
 import sys
+import uuid
 from contextlib import asynccontextmanager
 import json
 import os
@@ -49,8 +51,30 @@ from . import site_patterns
 from . import user_data
 from . import __version__ as _VERSION
 _SERVICE_NAME = "browser_agent"
-script_dir = os.path.dirname(os.path.abspath(__file__))
-_PID_FILE = os.path.join(script_dir, "browser_agent.pid")
+
+# ── 服务实例身份 ───────────────────────────────────────────
+# 客户端/维护操作据此确认连的是同一个实例；revision 是核心源码指纹，
+# 代码升级后旧服务仍在跑可被识别（升级需重启服务生效）。
+_INSTANCE_ID = uuid.uuid4().hex
+_STARTED_AT = datetime.now().isoformat(timespec="seconds")
+
+
+def _running_revision() -> str:
+    """核心源码指纹（sha256 前 12 位）；读不到的文件以文件名占位。"""
+    h = hashlib.sha256()
+    pkg = os.path.dirname(os.path.abspath(__file__))
+    for name in ("proxy.py", "proxy_ai.py", "proxy_tabs.py", "proxy_auth.py",
+                 "site_patterns.py", "browser_attach.py", "local_search.py",
+                 "user_data.py", "server.py", "client.py"):
+        try:
+            with open(os.path.join(pkg, name), "rb") as f:
+                h.update(f.read())
+        except OSError:
+            h.update(name.encode("utf-8"))
+    return h.hexdigest()[:12]
+
+
+_RUNNING_REVISION = _running_revision()
 
 # ─────────────────────────────────────────────────────────
 # 应用状态
@@ -66,6 +90,10 @@ def _env_int(name: str, default: int) -> int:
 QUEUE_TIMEOUT_SEC = _env_int("BROWSER_AGENT_QUEUE_TIMEOUT", 600)
 # 空闲自动回收：所有会话超过该秒数无活动 → 自动关闭浏览器释放内存（0=禁用）
 IDLE_SHUTDOWN_SEC = _env_int("BROWSER_AGENT_IDLE_SHUTDOWN_SEC", 900)
+# 页级空闲回收：自建标签页超过该秒数无活动自动关闭（0=禁用；
+# 收养页、各会话 active 页、在途批会话名下的页除外——会话整体归
+# /session/stop 与全局空闲回收管）。批完成后事件驱动扫描（节流），心跳兜底。
+TAB_IDLE_SEC = _env_int("BROWSER_AGENT_TAB_IDLE_SEC", 1800)
 
 DEFAULT_SESSION = "default"
 
@@ -122,6 +150,9 @@ class AppState:
         self._session_locks: dict = {}
         self._registry_lock = asyncio.Lock()  # 会话注册的 check-and-create 互斥
         self._inflight = 0                    # 正在执行的命令批数（关停排水用）
+        # 关停维护态：/shutdown 触发后置位，排水期间拒绝新命令批/新会话，
+        # 防止排水永远等不完、或新批刚起步就被 SIGTERM 腰斩
+        self.maintenance = False
 
     def session_lock(self, sid: str) -> asyncio.Lock:
         """会话级命令锁（按需创建；创建互斥防两个请求各造一把）。"""
@@ -307,7 +338,18 @@ class AppState:
                              DEFAULT_SESSION 恒为 "user"。
         返回 (session, created, warning)。浏览器级配置（headless/viewport 等）只在
         浏览器冷启动时生效——浏览器已在运行时新会话沿用现有实例，返回 warning 说明。
+
+        整个 ensure 阶段计入 inflight：CDP 授权等待可达 120s，关停排水必须看得见
+        （所有调用方——run/check/session_start/macro/auth_ensure——由此统一覆盖）。
         """
+        self._inflight += 1
+        try:
+            return await self._ensure_session_inner(sid, owner, context_mode)
+        finally:
+            self._inflight -= 1
+
+    async def _ensure_session_inner(self, sid: str, owner: str = "",
+                                    context_mode: str = "isolated") -> tuple:
         warnings = None
         if self.proxy is not None and self.proxy.is_browser_open() and sid not in self.sessions:
             warnings = "浏览器已在运行（被其他会话共享）：本次传入的实例级配置（headless/viewport/代理等）未生效，会话沿用现有实例"
@@ -494,6 +536,26 @@ class AppState:
         _log(f"空闲回收：所有会话超时无活动 {idle}，关闭浏览器释放内存（{idle_sec}s 阈值）")
         await self.shutdown_browser()
 
+    async def recycle_idle_tabs(self, exclude_sid: Optional[str] = None) -> list:
+        """页级空闲回收：自建标签页超时无活动自动关闭。
+
+        保护集 = 各会话 active_tab ∪ **在途批会话**名下的页。批中途
+        switch_tab 的目标页要等批结束才回写 Session.active_tab——期间该页
+        只被 _set_current_tab 的触碰保活，锁被持有即视为在途，整组跳过，
+        回收由此在并发批下天然安全（不需要"全局 inflight 就不扫"的粗退避）。
+        exclude_sid：触发本次扫描的批所属会话——它刚完成 active_tab 回写，
+        自身按 active_tab 保护即可，不因自持锁被误跳过。
+        """
+        if TAB_IDLE_SEC <= 0 or not self.proxy or not self.proxy.is_browser_open():
+            return []
+        protected = {s.active_tab for s in self.sessions.values()}
+        for sid, lock in self._session_locks.items():
+            if sid != exclude_sid and lock.locked():
+                # 裸 sid 键（会话初始页）与 sid:: 前缀键都算该会话名下
+                protected.update(k for k in self.proxy._pages
+                                 if k == sid or self.proxy.tab_owner(k) == sid)
+        return await self.proxy.close_idle_tabs(TAB_IDLE_SEC, protected)
+
     async def shutdown_browser(self):
         attached = self.proxy.mode == "attach"
         if self.proxy:
@@ -623,7 +685,29 @@ async def execute_commands(commands: list, out_dir: str, compact: bool = False,
     try:
         return await _execute_commands_inner(commands, out_dir, compact, generate_report, session_id)
     finally:
+        # 批完成后顺手做页级空闲回收（事件驱动、节流；活跃会话场景比纯心跳
+        # 轮询更及时，零流量场景由全局空闲回收兜底）。先扫后减：扫描（含
+        # page.close）期间仍计在途，关停排水不会扫到一半被 SIGTERM 打断
+        await _sweep_idle_tabs(session_id)
         _state._inflight -= 1
+
+
+# 页级回收扫描节流：默认每 ≤30s 搭一次批的便车；阈值越小扫描越勤
+_TAB_SWEEP = {"last": 0.0}
+
+
+async def _sweep_idle_tabs(session_id: str) -> None:
+    if TAB_IDLE_SEC <= 0:
+        return
+    throttle = max(1.0, min(30.0, TAB_IDLE_SEC / 10))
+    now = time.monotonic()
+    if now - _TAB_SWEEP["last"] < throttle:
+        return
+    _TAB_SWEEP["last"] = now
+    try:
+        await _state.recycle_idle_tabs(exclude_sid=session_id)
+    except Exception as e:
+        _log(f"页级空闲回收异常（忽略）: {e}")
 
 
 async def _execute_commands_inner(commands, out_dir, compact, generate_report,
@@ -1112,6 +1196,13 @@ async def handle_status(request: web.Request) -> web.Response:
         "service": _SERVICE_NAME,
         "version": _VERSION,
         "status": "running",
+        # 服务实例身份：客户端/维护操作据此确认连的是同一实例；revision 为
+        # 核心源码指纹——升级代码后旧服务仍在跑可被识别（升级需重启生效）
+        "instance_id": _INSTANCE_ID,
+        "pid": os.getpid(),
+        "started_at": _STARTED_AT,
+        "revision": _RUNNING_REVISION,
+        "maintenance": _state.maintenance,
         "browser_active": browser_active,
         "browser_mode": _state.config.get("mode", "managed"),
         "session_id": _state.session_id,
@@ -1123,6 +1214,7 @@ async def handle_status(request: web.Request) -> web.Response:
         "active_batches": _state._inflight,
         "queue_timeout_sec": QUEUE_TIMEOUT_SEC,
         "idle_shutdown_sec": _state._effective_idle_sec(),
+        "tab_idle_sec": TAB_IDLE_SEC,
         # 前置检查输出站点经验列表：确定目标网站后先读对应先验（SKILL.md 契约）
         "site_patterns": [p["domain"] for p in sites.get("patterns", [])],
         "user_data_dir": user_data.data_dir(),
@@ -1237,6 +1329,21 @@ async def handle_session_refresh(request: web.Request) -> web.Response:
         return _json({"ok": False, "error": str(e)}, 500)
 
 
+# 维护态统一拒绝：关停排水期不收变更类请求；开放路由白名单与
+# AGENTS.md / command-reference 契约一致（/status /sites /macro/list /attach/*）。
+# 策略在此编码一次——新端点默认受保护，无需逐处粘贴守卫
+_MAINTENANCE_OPEN = {"/", "/status", "/stream", "/sites", "/macro/list",
+                     "/attach/discover", "/attach/select"}
+
+
+@web.middleware
+async def _maintenance_middleware(request, handler):
+    if _state.maintenance and request.path not in _MAINTENANCE_OPEN:
+        return _json({"ok": False, "maintenance": True,
+                      "error": "服务正在关停（排水排除在途命令批），请稍后重试"})
+    return await handler(request)
+
+
 async def handle_run(request: web.Request) -> web.Response:
     body = await _read_body(request)
     if not body:
@@ -1314,7 +1421,9 @@ async def handle_check(request: web.Request) -> web.Response:
 
 
 async def handle_shutdown(request: web.Request) -> web.Response:
-    resp = _json({"ok": True, "message": "正在关闭..."})
+    # 维护态先行：排水期间拒绝新命令批/新会话（/status 仍可用，供观察退出）
+    _state.maintenance = True
+    resp = _json({"ok": True, "message": "正在关闭...", "instance_id": _INSTANCE_ID})
     asyncio.get_event_loop().call_later(0.3, lambda: asyncio.ensure_future(_do_shutdown()))
     return resp
 
@@ -1326,18 +1435,25 @@ async def _do_shutdown():
     旧版即此 bug，一直靠 cleanup.sh 的 pkill 兜底）；也不能直接 loop.stop()——
     新版 aiohttp 的 run_app 用 run_until_complete 包着 main_task，强停会抛
     RuntimeError。SIGTERM 是 run_app 注册的官方优雅退出通道。
+    全程异常兜底：任何一步失败也必须走到 SIGTERM——否则进程僵死且
+    maintenance 永久为真，所有请求被拒。
     """
-    # 排水：在途命令批最多等 10s；超时则如实记录并继续（shutdown 是显式意图）
-    deadline = time.time() + 10
-    while _state._inflight > 0 and time.time() < deadline:
-        await asyncio.sleep(0.2)
-    if _state._inflight > 0:
-        _log(f"关停排水超时：仍有 {_state._inflight} 个命令批在执行，继续关停")
-    await _state.shutdown_browser()
-    _remove_pid()
-    # Windows 无 add_signal_handler；os.kill(pid, SIGTERM) 在 Windows 即 TerminateProcess——
-    # 浏览器落盘/关闭已在上方完成，此处仅终止进程本体，语义等价
-    os.kill(os.getpid(), signal.SIGTERM)
+    try:
+        # 排水：在途命令批最多等 10s；超时则如实记录并继续（shutdown 是显式意图）
+        deadline = time.time() + 10
+        while _state._inflight > 0 and time.time() < deadline:
+            await asyncio.sleep(0.2)
+        if _state._inflight > 0:
+            _log(f"关停排水超时：仍有 {_state._inflight} 个命令批在执行，继续关停")
+        try:
+            await _state.shutdown_browser()
+        except Exception as e:
+            _log(f"关停时浏览器落盘/关闭异常（继续退出）: {e}")
+        _remove_pid()
+    finally:
+        # Windows 无 add_signal_handler；os.kill(pid, SIGTERM) 在 Windows 即
+        # TerminateProcess——浏览器落盘/关闭已在上方尽力完成，此处终止进程本体
+        os.kill(os.getpid(), signal.SIGTERM)
 
 
 def _json(data: dict, status: int = 200) -> web.Response:
@@ -1461,7 +1577,10 @@ async def handle_attach_select(request: web.Request) -> web.Response:
             "candidates": browser_attach.discover_browsers(),
         })
     if attach_dir:
-        attach_dir = browser_attach.expand_path(attach_dir)
+        try:
+            attach_dir = browser_attach.expand_path(attach_dir)
+        except ValueError as e:
+            return _json({"ok": False, "error": f"attach_dir 路径无效: {e}"})
         if not browser_attach.is_browser_data_dir(attach_dir):
             return _json(browser_attach.error_response(
                 f"目录不是浏览器数据目录（缺少 Local State）: {attach_dir}",
@@ -1474,21 +1593,21 @@ async def handle_attach_select(request: web.Request) -> web.Response:
 async def handle_attach_discover(request: web.Request) -> web.Response:
     """GET /attach/discover — 列出本机可附着的浏览器（含远程调试开关状态）。"""
     from . import browser_attach
-    return _json({"ok": True, "browsers": browser_attach.discover_browsers(),
-                  "remedy": browser_attach.REMEDY_STEPS})
+    # 根目录 readdir + 逐项 stat 是文件 IO：下线程，不占事件循环
+    return _json(await asyncio.to_thread(browser_attach.discover_payload))
 
 
 # ─────────────────────────────────────────────────────────
 # PID 管理
 # ─────────────────────────────────────────────────────────
 def _write_pid(port: int):
-    with open(_PID_FILE, "w") as f:
+    with open(user_data.pid_file(), "w") as f:
         json.dump({"pid": os.getpid(), "port": port, "service": _SERVICE_NAME}, f)
 
 
 def _remove_pid():
     try:
-        os.remove(_PID_FILE)
+        os.remove(user_data.pid_file())
     except FileNotFoundError:
         pass
 
@@ -1597,7 +1716,7 @@ def main():
         "stealth_enabled": stealth_enabled,
     })
 
-    app = web.Application()
+    app = web.Application(middlewares=[_maintenance_middleware])
     app.router.add_get("/status", handle_status)
     app.router.add_get("/", handle_status)
     app.router.add_get("/stream", handle_stream)
@@ -1647,6 +1766,8 @@ def main():
         async def _heartbeat():
             while True:
                 await asyncio.sleep(60)
+                # 页级空闲回收兜底（零流量场景；节流与错误处理复用唯一入口）
+                await _sweep_idle_tabs(None)
                 # 空闲回收：所有会话超时无活动 → 关浏览器释放内存（HTTP 服务保留）
                 try:
                     await _state.idle_recycle()

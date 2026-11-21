@@ -22,8 +22,14 @@ instance"（可能需重启浏览器）。
 """
 from __future__ import annotations
 
+import collections
+import concurrent.futures
 import os
+import re
+import socket
+import sys
 from typing import Optional
+from urllib.parse import urlparse
 
 from .user_data import data_dir
 
@@ -78,11 +84,35 @@ REMEDY_STEPS = (
 )
 
 
+_WIN_ENV_RE = re.compile(r"%([A-Za-z0-9_]+)%")
+
+
 def _expand(path: str) -> str:
-    return os.path.normpath(os.path.expanduser(path))
+    """展开 ~ 与 Windows 环境变量（%LOCALAPPDATA% 等）后归一路径。
+
+    引用了未设置的环境变量时抛 ValueError（配置写错应显式报错，不静默保留字面量）。
+    """
+    v = str(path).strip()
+    if os.name == "nt":
+        def _sub(m: "re.Match[str]") -> str:
+            val = os.environ.get(m.group(1).upper())
+            if val is None:
+                raise ValueError(f"环境变量 {m.group(1).upper()} 未设置，无法展开 {path}")
+            return val
+        v = _WIN_ENV_RE.sub(_sub, v)
+    return os.path.normpath(os.path.expanduser(v))
 
 
-expand_path = _expand  # 供 client/server 复用的公开名
+expand_path = _expand  # 供 client/server 复用的公开名（严格版：坏引用即报错）
+
+
+def _expand_safe(path: str) -> str:
+    """偏好文件等持久值的展开：引用了未设置的环境变量时退化为 ~ 展开，
+    不让一条历史坏值炸掉整个偏好读取。"""
+    try:
+        return _expand(path)
+    except ValueError:
+        return os.path.normpath(os.path.expanduser(str(path).strip()))
 
 
 def is_browser_data_dir(path: str) -> bool:
@@ -159,7 +189,7 @@ def read_preference() -> dict:
             for line in f:
                 line = line.strip()
                 if line.startswith("BROWSER_AGENT_ATTACH_DIR="):
-                    pref["attach_dir"] = _expand(line.split("=", 1)[1])
+                    pref["attach_dir"] = _expand_safe(line.split("=", 1)[1])
                 elif line.startswith("BROWSER_AGENT_CDP_ENDPOINT="):
                     pref["cdp_endpoint"] = line.split("=", 1)[1]
     except OSError:
@@ -180,7 +210,7 @@ def save_preference(attach_dir: Optional[str] = None,
     if cdp_endpoint is None:
         cdp_endpoint = os.getenv("BROWSER_AGENT_CDP_ENDPOINT") or current["cdp_endpoint"]
     new = {
-        "attach_dir": _expand(attach_dir) if attach_dir else "",
+        "attach_dir": _expand_safe(attach_dir) if attach_dir else "",
         "cdp_endpoint": cdp_endpoint or "",
     }
     lines = []
@@ -210,7 +240,7 @@ def resolve_endpoint(attach_dir: Optional[str] = None,
     或 {"ok": False, "error", "remedy", "candidates"}。绝不静默换目标浏览器。
     """
     pref = read_preference()
-    explicit_dir = _expand(attach_dir) if attach_dir else None
+    explicit_dir = _expand_safe(attach_dir) if attach_dir else None
 
     # 显式 cdp_endpoint 最优先；其次（未显式给目录时）已保存的端点偏好。
     # 显式端点无需发现候选——提前返回，省一次全根扫描
@@ -275,3 +305,267 @@ def format_attach_error(info: dict) -> str:
         msg += ("\n指定其一: browser-agent-client attach <数据目录>（保存偏好后重启服务），"
                 "或配置 browser.attach_dir / 环境变量 BROWSER_AGENT_ATTACH_DIR")
     return msg
+
+
+# ── 进程级浏览器身份 pin ───────────────────────────────────
+# 同一服务进程内只附着同一台浏览器：断线重连（浏览器重启后自动恢复）时若偏好
+# 已指向另一目标（别的数据目录**或别的 CDP 端点**），硬错提示先停服务再切换
+# ——绝不静默换目标。身份令牌：数据目录优先；端点直连无目录可比时用端点本身
+# （两种身份不互通，运行中从目录 A 换到端点 B 同样算换目标）。
+_PROCESS_PIN: dict = {"dir": None}
+
+
+def attach_identity(info: dict) -> Optional[str]:
+    """resolve_endpoint 结果 → 身份令牌（数据目录路径，或 endpoint:<url>）。"""
+    d = info.get("browser_dir")
+    if d:
+        return d
+    ep = info.get("endpoint")
+    return f"endpoint:{ep}" if ep else None
+
+
+def pinned_dir() -> Optional[str]:
+    """本进程已成功附着的浏览器身份令牌（未附着 → None）。"""
+    return _PROCESS_PIN["dir"]
+
+
+def set_pinned_dir(identity: Optional[str]) -> None:
+    """记录进程级 pin（附着**完整成功**后调用）。目录身份在此归一展开；
+    None 不清空既有 pin——清空只能经 reset_pin（防止端点直连路径把已 pin
+    的目录身份抹掉）。"""
+    if identity:
+        token = str(identity)
+        _PROCESS_PIN["dir"] = token if token.startswith("endpoint:") \
+            else _expand_safe(token)
+
+
+def reset_pin() -> None:
+    """清空进程级 pin（测试隔离用）。"""
+    _PROCESS_PIN["dir"] = None
+
+
+def pin_mismatch_error(new_identity: Optional[str]) -> Optional[str]:
+    """新身份与已 pin 身份不同 → 可直接展示的错误；相同/无法比较 → None。"""
+    old = _PROCESS_PIN["dir"]
+    if not old or not new_identity:
+        return None
+    new = str(new_identity)
+    if old.startswith("endpoint:") or new.startswith("endpoint:"):
+        if old == new:
+            return None
+    elif _realpath_or_self(old) == _realpath_or_self(new):
+        return None
+    return (f"本服务进程已附着浏览器 {old}，拒绝改连 {new}（不静默切换目标浏览器）。"
+            "如确要切换：先 browser-agent-client shutdown 停止服务，"
+            "再 browser-agent-client attach <数据目录或端点>")
+
+
+# ── 端点/端口工具 ─────────────────────────────────────────
+
+def endpoint_port(endpoint: str) -> Optional[int]:
+    """从 CDP 端点 URL 解析端口号（解析失败 → None）。"""
+    try:
+        return urlparse(str(endpoint)).port
+    except ValueError:
+        return None
+
+
+def port_listening(port: int, host: str = "127.0.0.1", timeout: float = 1.0) -> bool:
+    """TCP 层探测端口在监听（只建 TCP 连接，不建 WebSocket——
+    不触发浏览器的远程调试授权弹窗）。"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+# ── 清单外浏览器探测（attach --probe）──────────────────────
+# 边界由代码保证（不靠 AI 自觉）：
+# - 只列应用数据根目录最外层文件夹名，不进入任何子文件夹
+# - 探测范围严格限定在根目录内：拒绝 ~、越界相对路径、根目录之外/本身的
+#   绝对路径；经软链接指向根目录之外的同样拒绝（根目录内的软链接允许，
+#   如 snap 的 current → 修订目录）
+# - 文件夹内向下最多 PROBE_MAX_DEPTH 层，以 Local State 识别 Chromium 数据
+#   目录，识别后不再深入；目录数上限 PROBE_MAX_DIRS 防无界遍历
+# - 无权限的目录跳过并注明；识别出的目录只读 DevToolsActivePort + TCP 探测
+PROBE_MAX_DEPTH = 3
+PROBE_MAX_DIRS = 500
+
+
+def app_data_roots() -> list:
+    """各平台浏览器数据目录通常所在的应用数据根目录（存在的才列出）。"""
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        roots = [os.path.join(home, "Library", "Application Support")]
+    elif os.name == "nt":
+        roots = [os.environ.get("LOCALAPPDATA"), os.environ.get("APPDATA")]
+    else:
+        # Linux 另含 snap（~/snap/<应用>/…）与 flatpak（~/.var/app/<应用 id>/…）
+        roots = [os.path.join(home, ".config"),
+                 os.path.join(home, "snap"),
+                 os.path.join(home, ".var", "app")]
+    return [r for r in roots if r]
+
+
+def list_app_data_folders() -> list:
+    """每个应用数据根目录的最外层文件夹名（只 readdir 根目录本身）。"""
+    out = []
+    for root in app_data_roots():
+        try:
+            names = sorted(
+                e for e in os.listdir(root)
+                if os.path.isdir(os.path.join(root, e)) or os.path.islink(os.path.join(root, e))
+            )
+            out.append({"root": root, "folders": names})
+        except OSError as e:
+            out.append({"root": root, "error": e.errno or "EIO", "detail": str(e)})
+    return out
+
+
+def display_name(data_dir: str) -> str:
+    """数据目录路径里最有辨识度的文件夹名（跳过通用的 User Data 层）。"""
+    parts = [p for p in re.split(r"[\\/]+", str(data_dir)) if p]
+    for p in reversed(parts):
+        if p.lower() != "user data":
+            return p
+    return str(data_dir)
+
+
+def _strictly_inside(path: str, root: str) -> bool:
+    """统一路径包含谓词的模块内别名（实现在 utils.strictly_inside）。"""
+    from .utils import strictly_inside
+    return strictly_inside(path, root)
+
+
+def _realpath_or_self(p: str) -> str:
+    try:
+        return os.path.realpath(p)
+    except OSError:
+        return p
+
+
+def _resolve_probe_targets(value: str) -> tuple:
+    """文件夹参数 → (待探测绝对路径列表, 错误信息)。
+
+    绝对/相对两分支统一为：先算候选（绝对名一个；相对名在每个根下各一个），
+    再用同一谓词（存在 + 严格位于某根之内）过滤，最后按分支选错误信息。
+    """
+    v = value.strip()
+    roots = app_data_roots()
+    hint = (f"只接受应用数据根目录（{'、'.join(roots) or '当前平台未知'}）下的"
+            "相对文件夹名，如 Google、BraveSoftware")
+    if not v:
+        return [], f"需要文件夹参数；{hint}"
+    if v.startswith("~"):
+        return [], f"不接受 ~ 路径；{hint}"
+    is_abs = os.path.isabs(v)
+    candidates = [os.path.normpath(v)] if is_abs \
+        else [os.path.normpath(os.path.join(r, v)) for r in roots]
+    valid = [c for c in candidates
+             if os.path.exists(c) and any(
+                 _strictly_inside(_realpath_or_self(c), _realpath_or_self(r))
+                 for r in roots)]
+    if is_abs and not valid:
+        # 存在但在根外（过滤掉）与根本不存在，报不同的错误
+        if os.path.exists(candidates[0]):
+            return [], f"{candidates[0]} 在应用数据根目录之外，已拒绝；{hint}"
+        return [], f"应用数据根目录下不存在 {candidates[0]}"
+    if not valid:
+        return [], f"应用数据根目录下没有文件夹 {v}；{hint}"
+    return valid, None
+
+
+def _known_browser_names() -> dict:
+    """{realpath(数据目录): 规范名}——探测结果命名与已知清单互查用，每轮建一次。"""
+    return {os.path.realpath(_expand_safe(raw)): name
+            for name, raw in default_roots()}
+
+
+def _describe_browser_dir(data_dir: str, known_names: dict) -> dict:
+    """单个数据目录的探测结论：显示名 + 远程调试状态（只读端口文件 + TCP）。
+
+    显示名优先取已知清单里的规范名（find-url --browser / default_roots 用同一
+    套名字），清单外才退回路径推断名——两个入口的名字可互查。"""
+    data_name = known_names.get(os.path.realpath(data_dir)) or display_name(data_dir)
+    port = read_devtools_port(data_dir)
+    if port is not None:
+        listening = port_listening(port)
+        remote = {"enabled": listening, "port": port, "detail":
+                  "" if listening else
+                  f"DevToolsActivePort 记录的端口 {port} 未在监听（浏览器未运行或开关已关闭）"}
+    else:
+        port_file = os.path.join(data_dir, "DevToolsActivePort")
+        try:
+            exists = os.path.isfile(port_file)
+        except OSError:
+            exists = False
+        remote = {"enabled": False, "port": None, "detail":
+                  ("无法读取 DevToolsActivePort（权限不足）" if exists
+                   else "没有 DevToolsActivePort（浏览器未运行或远程调试开关未开启）")}
+    return {"name": data_name, "data_dir": data_dir,
+            "remote_debugging": remote,
+            "attach_hint": f'browser-agent-client attach "{data_dir}"'}
+
+
+def discover_payload() -> dict:
+    """/attach/discover（HTTP）与 client attach --discover（CLI）共用的单一构造：
+    已知浏览器 + 应用数据根目录文件夹名 + probe 提示 + 处理步骤。"""
+    return {"ok": True, "browsers": discover_browsers(),
+            "app_data_folders": list_app_data_folders(),
+            "probe_hint": ("清单外的浏览器：从应用数据根目录的文件夹名里认出"
+                           "候选（如 Dia、BraveSoftware），用 attach --probe <文件夹> 探测"),
+            "remedy": REMEDY_STEPS}
+
+
+def probe_app_data_folder(arg: str) -> dict:
+    """在应用数据根目录内的指定文件夹里寻找 Chromium 数据目录（受控探测）。"""
+    targets, err = _resolve_probe_targets(arg)
+    if err:
+        return {"ok": False, "error": err}
+    real_roots = [_realpath_or_self(r) for r in app_data_roots()]
+    known_names = _known_browser_names()
+    results, found = [], 0
+    for folder in targets:
+        browsers: list = []
+        skipped: list = []
+        truncated = False
+        seen = {_realpath_or_self(folder)}
+        queue = collections.deque([(folder, 0)])
+        visited = 0
+        while queue:
+            d, depth = queue.popleft()
+            visited += 1
+            if visited > PROBE_MAX_DIRS:
+                truncated = True
+                break
+            try:
+                if is_browser_data_dir(d):
+                    browsers.append(d)
+                    continue  # 识别为数据目录后不再深入
+                if depth < PROBE_MAX_DEPTH:
+                    for entry in os.listdir(d):
+                        p = os.path.join(d, entry)
+                        if not os.path.isdir(p):
+                            continue
+                        real = _realpath_or_self(p)
+                        # 根目录内的软链接允许（snap current）；指向外部的拒绝
+                        if any(_strictly_inside(real, r) for r in real_roots):
+                            if real not in seen:
+                                seen.add(real)
+                                queue.append((p, depth + 1))
+            except OSError as e:
+                skipped.append({"dir": d, "error": e.errno or "EIO"})
+        # 目录扫描先完成，TCP 探测并发做（每台浏览器最多 1s 连接超时）
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=4) as pool:
+            described = list(pool.map(
+                lambda d: _describe_browser_dir(d, known_names), browsers))
+        found += len(described)
+        results.append({"folder": folder, "browsers": described,
+                        "skipped": skipped, "truncated": truncated})
+    res = {"ok": found > 0, "folders": results}
+    if not found:
+        res["error"] = "探测范围内没有找到 Chromium 浏览器数据目录（Local State）"
+        res["remedy"] = REMEDY_STEPS
+    return res

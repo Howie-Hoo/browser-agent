@@ -3,6 +3,7 @@
 只在 RUN_E2E=1 时由 test_e2e_*.py 使用（需要真实浏览器环境）。
 绝不触碰真实用户数据：BROWSER_AGENT_HOME 一律指向临时目录。
 """
+from contextlib import contextmanager
 import http.server
 import json
 import os
@@ -40,6 +41,27 @@ MAIN_PAGE = """<!doctype html><html><head><title>E2E 标的页</title></head><bo
 SECOND_PAGE = """<!doctype html><html><head><title>第二页</title></head><body>
 <h1 id="second-title">第二页内容</h1></body></html>"""
 
+# 坐标点击标的页：目标区内点击计数并记录命中坐标（click_xy 实战验证用）
+XY_PAGE = """<!doctype html><html><head><title>坐标页</title></head>
+<body style="margin:0">
+<div id="xy-target" style="position:absolute;left:100px;top:100px;width:200px;height:100px;
+  background:#4a7">点击目标（命中会计数并记录坐标）</div>
+<span id="hits" style="position:fixed;left:2px;top:2px;font-size:12px">0</span>
+<script>
+window.lastClick = null;
+document.addEventListener('click', e => {
+  if (e.target.closest('#xy-target')) {
+    document.getElementById('hits').textContent =
+      parseInt(document.getElementById('hits').textContent || '0') + 1;
+    window.lastClick = {x: e.clientX, y: e.clientY};
+  }
+});
+</script></body></html>"""
+
+# 超长页：direction=top/bottom 滚动验证用
+TALL_PAGE = """<!doctype html><html><head><title>长页</title></head>
+<body style="margin:0;height:6000px"><div style="height:6000px">tall</div></body></html>"""
+
 IFRAME_PAGE = """<!doctype html><html><head><title>iframe 内部</title></head><body>
 <h1 id="iframe-title">iframe 内部标题</h1>
 <button id="if-btn" onclick="this.textContent='iframe 已点'">iframe 按钮</button>
@@ -52,6 +74,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             body = IFRAME_PAGE
         elif self.path.startswith("/second"):
             body = SECOND_PAGE
+        elif self.path.startswith("/xy"):
+            body = XY_PAGE
+        elif self.path.startswith("/tall"):
+            body = TALL_PAGE
         else:
             body = MAIN_PAGE
         data = body.encode("utf-8")
@@ -155,3 +181,84 @@ def fresh_home(prefix="ba-e2e") -> str:
 
 def cleanup_home(home: str) -> None:
     shutil.rmtree(home, ignore_errors=True)
+
+
+# ── 真实 Chrome 编排（临时 profile，自管端口）────────────────
+
+CHROME_CANDIDATES = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+]
+
+
+def find_chrome() -> str:
+    for p in CHROME_CANDIDATES:
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+def wait_devtools_port(profile_dir: str, timeout=25) -> int:
+    """轮询等待 Chrome 写出 DevToolsActivePort（解析复用 browser_attach）。"""
+    from browser_agent import browser_attach as ba
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        port = ba.read_devtools_port(profile_dir)
+        if port is not None:
+            return port
+        time.sleep(0.3)
+    raise RuntimeError("Chrome 未在超时内写出 DevToolsActivePort")
+
+
+def spawn_chrome(prefix: str = "ba-e2e-chrome-") -> dict:
+    """启动一台临时 profile 的真实 Chrome（自管端口）；返回
+    {proc, dir, port}。调用方负责 proc 终结与目录清理（stop_chrome）。"""
+    import subprocess
+    import tempfile
+    binary = find_chrome()
+    if not binary:
+        raise RuntimeError("本机无可用 Chromium 系浏览器")
+    profile = tempfile.mkdtemp(prefix=prefix)
+    proc = subprocess.Popen([
+        binary, "--headless=new", "--remote-debugging-port=0",
+        f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check",
+        "about:blank",
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return {"proc": proc, "dir": profile, "port": wait_devtools_port(profile)}
+
+
+def stop_chrome(chrome: dict) -> None:
+    chrome["proc"].terminate()
+    try:
+        chrome["proc"].wait(timeout=10)
+    except Exception:
+        chrome["proc"].kill()
+    shutil.rmtree(chrome["dir"], ignore_errors=True)
+
+
+@contextmanager
+def launched_service(port: int, url: str, prefix: str = "ba-e2e-svc-", env: dict = None):
+    """函数级服务编排：临时 HOME + 起服务 + 收尾（关停/兜底 kill + 清目录）。
+
+    env 里的变量在服务进程启动期间临时注入（如 BROWSER_AGENT_TAB_IDLE_SEC）。
+    """
+    saved_env = {k: os.environ.get(k) for k in (env or {})}
+    try:
+        for k, v in (env or {}).items():
+            os.environ[k] = str(v)
+        home = fresh_home(prefix)
+        s = Service(port, home, extra_args=[f"--url={url}"])
+        s.start()
+        try:
+            yield s
+        finally:
+            s.shutdown()
+            cleanup_home(home)
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v

@@ -13,7 +13,11 @@ CLI（pip 安装后为 browser-agent-client；未安装用 python -m browser_age
   browser-agent-client stop-session        关闭本客户端会话（多任务共享服务时用它代替 shutdown）
   browser-agent-client sites               列出已积累的站点经验
   browser-agent-client sites <域名或URL>   读取该站点经验
+  browser-agent-client find-url [关键词…] [--only bookmarks|history] [--browser <名>]
+                                [--limit N] [--since 1d|7h|YYYY-MM-DD] [--sort recent|visits]
+                                          本地检索浏览器书签/历史（内部系统、之前看过的页面）
   browser-agent-client attach --discover   列出可附着的本机浏览器（含远程调试开关状态）
+  browser-agent-client attach --probe <文件夹>  探测清单外浏览器（应用数据根目录下的文件夹名）
   browser-agent-client attach <数据目录>   保存附着偏好并以 attach 模式启动服务
   browser-agent-client attach --forget     清除附着偏好
   browser-agent-client shutdown
@@ -37,7 +41,6 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
-_PID_FILE = os.path.join(_PKG_DIR, "browser_agent.pid")
 _SERVICE_NAME = "browser_agent"
 
 
@@ -71,8 +74,9 @@ def _err(msg: str):
 # PID 工具
 # ─────────────────────────────────────────────────────────
 def _read_pid() -> Optional[dict]:
+    from . import user_data
     try:
-        with open(_PID_FILE) as f:
+        with open(user_data.pid_file()) as f:
             return json.load(f)
     except Exception:
         return None
@@ -361,13 +365,32 @@ class BrowserAgentClient:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    # ── 本地浏览器资源检索 ────────────────────────────────
+
+    def find_url(self, keywords, only: Optional[str] = None,
+                 browser: Optional[str] = None, limit=20,
+                 since=None, sort: str = "recent") -> dict:
+        """从本机浏览器书签/历史检索 URL（纯本地文件操作，无需服务在运行）。
+
+        适用：公网搜不到的组织内部系统、用户之前访问过但不记得地址的页面、
+        最近高频访问的网站（sort=visits）。参数校验/执行统一在
+        local_search.search（与命令批共用一份错误形状）。
+        """
+        from .local_search import search
+        return search(keywords=keywords, only=only, browser=browser,
+                      limit=limit, since=since, sort=sort)
+
     # ── 附着日常浏览器 ────────────────────────────────────
 
     def attach_discover(self) -> dict:
-        """列出本机可附着的浏览器（含远程调试开关状态）。"""
+        """列出本机可附着的浏览器（含远程调试开关状态；与 HTTP 端点共用构造）。"""
         from . import browser_attach
-        return {"ok": True, "browsers": browser_attach.discover_browsers(),
-                "remedy": browser_attach.REMEDY_STEPS}
+        return browser_attach.discover_payload()
+
+    def attach_probe(self, folder: str) -> dict:
+        """在应用数据根目录内受控探测 Chromium 数据目录（清单外浏览器）。"""
+        from . import browser_attach
+        return browser_attach.probe_app_data_folder(folder)
 
     def attach(self, target: str = "") -> bool:
         """保存附着偏好并以 attach 模式（重新）启动服务。
@@ -378,7 +401,11 @@ class BrowserAgentClient:
         if target:
             is_endpoint = "://" in target
             if not is_endpoint:
-                target = browser_attach.expand_path(target)
+                try:
+                    target = browser_attach.expand_path(target)
+                except ValueError as e:
+                    _err(f"附着目录路径无效: {e}")
+                    return False
                 if not browser_attach.is_browser_data_dir(target):
                     _err(browser_attach.format_attach_error(browser_attach.error_response(
                         f"目录不是浏览器数据目录（缺少 Local State）: {target}",
@@ -413,7 +440,13 @@ class BrowserAgentClient:
             self._http.post(f"{self._base}/shutdown", json={}, timeout=15)
         except Exception:
             pass
-        time.sleep(1)
+        # 等旧实例真正退出再启动：排水期间 /status 仍应答（维护态设计），
+        # 固定 sleep 会把排水中的旧服务误判为「已在运行」→ 假成功、后继无人
+        deadline = time.time() + 25  # 排水上限 10s + 浏览器关闭余量
+        while time.time() < deadline:
+            if self.get_status() is None:
+                break
+            time.sleep(0.3)
         return self.start_service()
 
     def run_single(self, action: str, **kwargs) -> dict:
@@ -442,23 +475,69 @@ class BrowserAgentClient:
 # ─────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────
+# 取值型旗标：支持 "--flag 值" 与 "--flag=值" 两种写法（文档示例用空格式）
+_VALUE_FLAGS = {"--port", "--url", "--slow-mo", "--only", "--browser",
+                "--limit", "--since", "--sort", "--probe"}
+
+
 def _parse_args(args):
     sub = args[0] if args else "status"
     pos, opts = [], {"port": 7788, "url": "http://localhost:3000", "headless": False, "slow_mo": 200}
-    for a in args[1:]:
+    i = 1
+    while i < len(args):
+        a = args[i]
         if a == "--headless":
             opts["headless"] = True; opts["slow_mo"] = 0
-        elif a.startswith("--port="):
-            opts["port"] = int(a.split("=")[1])
-        elif a.startswith("--url="):
-            opts["url"] = a.split("=", 1)[1]
-        elif a.startswith("--slow-mo="):
-            opts["slow_mo"] = int(a.split("=")[1])
+        elif a.startswith("--"):
+            name, sep, val = a.partition("=")
+            if not sep and name in _VALUE_FLAGS and i + 1 < len(args):
+                val = args[i + 1]  # 空格式取值
+                i += 1
+            if sep or val:
+                if name == "--port":
+                    opts["port"] = int(val)
+                elif name == "--slow-mo":
+                    opts["slow_mo"] = int(val)
+                elif name in ("--url", "--only", "--browser", "--since",
+                              "--sort", "--probe", "--limit"):
+                    # limit 保持字符串：int 校验统一交给 from_params（坏值干净报错）
+                    opts[name.lstrip("-").replace("-", "_")] = val
         elif a.startswith("http://") or a.startswith("https://"):
             opts["url"] = a
         elif not a.startswith("-"):
             pos.append(a)
+        i += 1
     return sub, pos, opts
+
+
+def _print_find_url(result: dict, sort: str = "recent") -> None:
+    """格式化输出本地检索结果（书签/历史分节，| 分隔字段）。"""
+    if not result.get("ok"):
+        _err(result.get("error", "检索失败"))
+        if result.get("remedy"):
+            _log(f"处理步骤: {result['remedy']}")
+        return
+    bookmarks = result.get("bookmarks", [])
+    history = result.get("history", [])
+    if bookmarks:
+        print(f"[书签] {len(bookmarks)} 条")
+        for b in bookmarks:
+            segs = [b.get("name") or "(无标题)", b.get("url", "")]
+            if b.get("folder"):
+                segs.append(b["folder"])
+            print("  " + " | ".join(segs))
+    if bookmarks and history:
+        print()
+    if history:
+        print(f"[历史] {len(history)} 条（{'按访问次数' if sort == 'visits' else '按最近访问'}）")
+        for h in history:
+            segs = [h.get("title") or "(无标题)", h.get("url", ""),
+                    h.get("visited_at_iso", "")]
+            if h.get("visit_count", 0) > 1:
+                segs.append(f"visits={h['visit_count']}")
+            print("  " + " | ".join(segs))
+    if not bookmarks and not history:
+        print("（无匹配结果）")
 
 
 def main():
@@ -519,14 +598,33 @@ def main():
                 print(json.dumps(result, ensure_ascii=False, indent=2))
             sys.exit(0 if result.get("ok") else 1)
 
+        elif sub == "find-url":
+            result = client.find_url(
+                pos, only=opts.get("only"), browser=opts.get("browser"),
+                limit=opts.get("limit", 20), since=opts.get("since"),
+                sort=opts.get("sort", "recent"))
+            _print_find_url(result, sort=opts.get("sort", "recent"))
+            sys.exit(0 if result.get("ok") else 1)
+
         elif sub == "attach":
-            # --discover 列出本机浏览器；--forget 清除偏好；带参数 = 保存偏好并启动
+            # --discover 列出本机浏览器；--probe 探测清单外浏览器（空格/等值两种
+            # 写法都经 _parse_args 归一为 opts["probe"]）；--forget 清除偏好；
+            # 带参数 = 保存偏好并启动
             discover = "--discover" in args[1:]
             forget = "--forget" in args[1:]
+            probe = opts.get("probe")  # 空格/等值两种写法已由 _parse_args 归一
             if discover:
                 res = client.attach_discover()
                 print(json.dumps(res, ensure_ascii=False, indent=2))
                 sys.exit(0)
+            if probe is not None or "--probe" in args[1:]:
+                folder = probe or (pos[0] if pos else "")
+                if not folder:
+                    _err("用法: browser-agent-client attach --probe <应用数据根目录下的文件夹>")
+                    sys.exit(1)
+                res = client.attach_probe(folder)
+                print(json.dumps(res, ensure_ascii=False, indent=2))
+                sys.exit(0 if res.get("ok") else 1)
             if forget:
                 from . import browser_attach
                 browser_attach.save_preference(attach_dir="", cdp_endpoint="")
@@ -537,7 +635,8 @@ def main():
 
         else:
             _err(f"未知子命令: {sub}")
-            print("可用: status | start | run | check | reset | stop-session | sites | attach | shutdown")
+            print("可用: status | start | run | check | reset | stop-session | sites | "
+                  "find-url | attach | shutdown")
             sys.exit(1)
 
 

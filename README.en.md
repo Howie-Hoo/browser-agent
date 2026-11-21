@@ -74,7 +74,7 @@ with BrowserAgentClient(base_url="http://localhost:3000") as client:
     print(report["summary"])
 ```
 
-**CLI:** `status | start | run <json> | check <type> | reset | stop-session | sites [domain] | attach <dir|--discover|--forget> | shutdown`
+**CLI:** `status | start | run <json> | check <type> | reset | stop-session | sites [domain] | find-url [keywords…] | attach <dir|--discover|--probe folder|--forget> | shutdown`
 
 Full command reference (45+ commands / 20 HTTP endpoints): [docs/command-reference.md](docs/command-reference.md). More install options (plugin channel, one line to your AI) under [Install](#install).
 
@@ -89,15 +89,24 @@ browser-agent-client attach "$HOME/Library/Application Support/Google/Chrome"
 Prerequisite: open `chrome://inspect/#remote-debugging` in the target browser and tick
 "Allow remote debugging for this browser instance" (a browser restart may be required).
 
+**Search local browser resources** (bookmarks/history; intranet systems, pages you visited
+before — no running service required):
+
+```bash
+browser-agent-client find-url finance portal           # multi-word AND over title+URL
+browser-agent-client find-url --since 7d --sort visits # most-visited sites this week
+```
+
 ## Core capabilities
 
 | Capability | Notes |
 | --- | --- |
 | Three-tier perception | Semantic → structural → precise primitives, with suggested fallbacks on failure |
 | One browser, many sessions | Single Chromium, N isolated contexts; serialized command batches (`BROWSER_AGENT_QUEUE_TIMEOUT` caps waiting); idle browser auto-reclaimed |
-| Attach to the daily browser | CDP-attach the user's daily Chromium browser: login state for free, real fingerprint, stealth auto-disabled; minimal-intrusion contract (never touches user tabs, never clears user storage, no focus stealing); no fixed-port scanning, hard errors instead of silently switching browsers |
+| Attach to the daily browser | CDP-attach the user's daily Chromium browser: login state for free, real fingerprint, stealth auto-disabled; minimal-intrusion contract (never touches user tabs, never clears user storage, no focus stealing); no fixed-port scanning, hard errors instead of silently switching browsers, never switches target mid-run (process-level pin); self-created/adopted pages block page-script probes of the local debug port (anti-detection); off-list browsers via `attach --probe` (scoped discovery) |
 | Auth profiles | Named login state on disk (Playwright storageState + rule: `url_pattern` / `js` / `cookie_exists`); `ensure_auth` reuses when valid, re-runs your login commands when stale; credentials never leave files/logs |
 | Site experience | Per-domain operating knowledge (platform traits / proven patterns / known pitfalls, date-stamped); navigations hint at existing entries; `read_site` / `write_site` close the loop in-band; reused across sessions |
+| Local browser search | `find-url` / `search_local`: search local browser **bookmarks + history** (intranet systems, pages you visited before); multi-browser multi-profile, time windows / visit-count sorting; purely local and read-only |
 | User data out of the package | Profiles / site experience / state / downloads all live in `~/.browser-agent` — pip upgrades never wipe them; legacy in-package data migrates automatically on first run (copy-only, never overwrites) |
 | Resource preflight | Memory check (min of host and cgroup v2) before launch; refuses below `BROWSER_AGENT_MIN_FREE_MB` to protect low-spec machines (skipped in attach mode) |
 | AI-friendly details | Always HTTP 200 with an `ok` field, automatic failure screenshots + possible_cause, page summary + site-experience hints attached to navigations, clip screenshots to save tokens, stealth fingerprint evasion |
@@ -145,6 +154,7 @@ Copy `config.example.yaml` to `browser_agent.yaml` at the repo root (or set `BRO
 | `BROWSER_AGENT_MAX_LOAD` | unchecked | 1-min loadavg ceiling; refuse to start above it |
 | `BROWSER_AGENT_QUEUE_TIMEOUT` | 600 | Max seconds a command batch waits in queue (0 = unlimited) |
 | `BROWSER_AGENT_IDLE_SHUTDOWN_SEC` | 900 | Reclaim after all sessions idle this long (0 = disable, effective immediately): managed closes the browser; attach closes own tabs but **keeps the connection** (reconnecting needs user re-authorization) |
+| `BROWSER_AGENT_TAB_IDLE_SEC` | 1800 | Close self-created tabs idle this long (0 = disable); adopted tabs, each session's active tab, and pages of sessions with an in-flight batch are never reclaimed; swept event-driven after each batch (throttled) with a heartbeat backstop |
 | `BROWSER_AGENT_REPORT_DIR` | repo temp/ | Output directory for reports / screenshots |
 | `BROWSER_AGENT_CONFIG` | — | Override config file path |
 | `BROWSER_AGENT_HOME` | `~/.browser-agent` | User-data root (profiles / site experience / state / downloads) |
