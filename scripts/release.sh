@@ -58,7 +58,7 @@ version_commit=$(git log -n1 --format=%H --grep="v$version" main)
 [ -n "$version_commit" ] || die "main 历史中找不到标题含 v$version 的版本提交"
 subject=$(git log -1 --format=%s "$version_commit")
 desc=$(python3 -c 'import re,sys;m=re.search(r"^\w+: v\S+ — (.+)$",sys.argv[1]);print(m.group(1) if m else sys.argv[1])' "$subject")
-info "发版 $tag：$desc"
+info "发版 ${tag}：$desc"
 
 # ---------- 3. 回归（E2E 默认跳过，见 AGENTS.md） ----------
 if [ "$SKIP_TESTS" -eq 0 ]; then
@@ -75,7 +75,7 @@ if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
     || die "tag $tag 已指向 ${tag_commit:0:8} ≠ HEAD；如需重打：git tag -d $tag && git push origin :refs/tags/$tag 后重跑"
   info "tag $tag 已存在且指向 HEAD，复用"
 else
-  git tag -a "$tag" -m "v$version：$desc"
+  git tag -a "$tag" -m "v${version}：$desc"
   info "已创建 tag $tag"
 fi
 
