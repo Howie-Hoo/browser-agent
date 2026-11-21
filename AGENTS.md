@@ -40,6 +40,19 @@ RUN_E2E=1 pytest tests/test_e2e_absorbed_attach.py -v  # E2E：调试端口防�
 attach E2E 用临时 profile 的独立 Chrome 实例（`--remote-debugging-port=0` 自管端口），
 不碰用户日常 profile。
 
+## 发版流程
+
+```bash
+scripts/release.sh          # 预检 → 版本一致性 → 单测 → tag → 推送 → GitHub Release
+```
+
+- 版本号三处必须一致才能发：`browser_agent/__init__.py`、`.claude-plugin/plugin.json`
+  （插件市场靠它识别更新）、版本提交（惯例 `feat: vX — 主题`，**正文会被原样用作
+  release notes**）；脚本会逐一校验，不一致即中止
+- tag 为 annotated `vX`，指向发布时 HEAD；release 自动标 latest
+- 补历史版本的 release 用 `gh release create vX --verify-tag --notes-file …`，
+  且先补旧版再发新版，避免抢走 latest
+
 ## 不变式（改动时必须保持）
 
 - **并发模型**：操作目标页由 `proxy._current_tab`（contextvars 存**可变 router 字典**
