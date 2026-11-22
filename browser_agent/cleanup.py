@@ -18,6 +18,11 @@
 整棵树同组）→ 仍在则 SIGKILL。Windows 用 `taskkill /T` 树杀。
 幂等：无残留即空操作；清理入口始终退出 0（它只是兜底，不该成为新的失败源）。
 
+孤儿回收时机（判据见 _reap_playwright_orphans）：「无 pid 记录」「服务已死」
+「本服务刚被关停成功」三类出口都扫——机器上已无本服务，残留的孤儿化
+playwright 只能是历史遗留或本次关停漏网；「不动它」类出口（端口上是别人的
+服务）不扫，别人的进程树归别人管。
+
 用法：browser-agent-cleanup（pip 安装后）或 python -m browser_agent.cleanup
 """
 from __future__ import annotations
@@ -153,6 +158,15 @@ def _drop_stale_pid_file() -> None:
         pass
 
 
+def _reap_and_report() -> None:
+    """扫孤儿 playwright 进程并汇报（无孤儿静默；判据宁可放过不可错杀）。"""
+    orphans = _reap_playwright_orphans()
+    if orphans:
+        _say(f"顺带回收 {len(orphans)} 个孤儿 playwright 进程（父链已断）：")
+        for opid, cmd in orphans:
+            _say(f"  - {opid}: {cmd}")
+
+
 def _reap_playwright_orphans() -> list:
     """回收孤儿化的 playwright 子进程（服务被 SIGKILL 后残留的 Chromium/driver）。
 
@@ -195,6 +209,7 @@ def cleanup() -> int:
     info = _read_pid_info()
     if not info:
         _say("无 pid 记录，无需清理")
+        _reap_and_report()  # 机器无本服务：孤儿只可能是历史残留
         return 0
     try:
         pid = int(info["pid"])
@@ -208,12 +223,8 @@ def cleanup() -> int:
         # 服务本体已死（SIGKILL/OOM 崩溃）：pid 文件之外，它的 playwright
         # 子进程可能成了孤儿（父链断、被 init 收养）——顺带回收，这正是
         # 清理工具存在的理由；识别不了的残留宁可留着
-        orphans = _reap_playwright_orphans()
+        _reap_and_report()
         _say(f"pid {pid} 已退出，清理 stale pid 文件")
-        if orphans:
-            _say(f"顺带回收 {len(orphans)} 个孤儿 playwright 进程（父链已断）：")
-            for opid, cmd in orphans:
-                _say(f"  - {opid}: {cmd}")
         _drop_stale_pid_file()
         return 0
 
@@ -235,6 +246,9 @@ def cleanup() -> int:
         _say("已请求优雅关停（排水 → 关浏览器 → 退出），等待退出…")
         if _wait_gone(pid, _GRACEFUL_WAIT_SEC):
             _say("已退出 ✓")
+            # 优雅路径无进程组信号兜底：driver 先死于 server（OOM/-9）时，
+            # 孤儿 Chromium 脱离 server 关闭管辖，主动扫一遍
+            _reap_and_report()
             _drop_stale_pid_file()
             return 0
         _say("优雅关停未在期限内完成，升级为进程树终止")
@@ -244,10 +258,12 @@ def cleanup() -> int:
     _terminate_tree(pid)
     if _wait_gone(pid, _TERM_WAIT_SEC):
         _say("已退出 ✓")
+        _reap_and_report()
         _drop_stale_pid_file()
         return 0
     _terminate_tree(pid, force=True)
     _say("已强制终止（SIGKILL / taskkill /F）")
+    _reap_and_report()
     _drop_stale_pid_file()
     return 0
 

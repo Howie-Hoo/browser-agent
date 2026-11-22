@@ -30,9 +30,15 @@ def _no_http(monkeypatch):
     monkeypatch.setattr(cleanup, "_http_get_json", lambda *a, **k: None)
 
 
-def test_no_pid_file_is_noop(isolated_home, capsys):
+def _no_orphans(monkeypatch):
+    """孤儿回收打桩：防测试真扫宿主 ps（副作用 + 不确定性）。"""
+    monkeypatch.setattr(cleanup, "_reap_playwright_orphans", lambda: [])
+
+
+def test_no_pid_file_is_noop(isolated_home, monkeypatch, capsys):
     # isolated_home 必须：否则 cleanup 会打到真实 ~/.browser-agent，
     # 把开发者正在跑的服务连同浏览器杀掉（AGENTS.md 测试纪律）
+    _no_orphans(monkeypatch)
     assert cleanup.cleanup() == 0
     assert "无 pid 记录" in capsys.readouterr().out
 
@@ -40,6 +46,7 @@ def test_no_pid_file_is_noop(isolated_home, capsys):
 def test_dead_pid_just_removes_stale_file(pid_file, monkeypatch):
     path = pid_file(pid=4321)
     monkeypatch.setattr(cleanup, "is_pid_alive", lambda pid: False)
+    _no_orphans(monkeypatch)
     assert cleanup.cleanup() == 0
     assert not path.exists()
 
@@ -70,6 +77,7 @@ def test_graceful_path_terminates_nothing(pid_file, monkeypatch):
     monkeypatch.setattr(cleanup, "_graceful_shutdown", lambda port, status=None: True)
     monkeypatch.setattr(cleanup, "_wait_gone",
                         lambda pid, timeout: True)
+    _no_orphans(monkeypatch)
     assert cleanup.cleanup() == 0
     assert terminated == []
 
@@ -93,6 +101,7 @@ def test_unresponsive_server_gets_tree_termination_then_force(pid_file, monkeypa
     monkeypatch.setattr(cleanup, "_cmdline",
                         lambda pid: "python -m browser_agent.server --port=7788")
     monkeypatch.setattr(cleanup, "_graceful_shutdown", lambda port, status=None: False)
+    _no_orphans(monkeypatch)
     calls = []
     monkeypatch.setattr(cleanup, "_terminate_tree",
                         lambda pid, force=False: calls.append(force))
@@ -171,3 +180,45 @@ def test_reap_playwright_orphans_targets_only_ppid1(monkeypatch):
     reaped = cleanup._reap_playwright_orphans()
     assert sorted(pid for pid, _ in reaped) == [100, 102]
     assert killed == [100, 102]
+
+
+# ── 孤儿回收时机（覆盖 driver 先死于 server 的漏网窗口）─────────
+
+def test_no_pid_file_still_reaps_orphans(isolated_home, monkeypatch, capsys):
+    """无 pid 记录（服务本就没跑）：孤儿只可能是历史残留，同样回收。
+    isolated_home 必须：否则读到真实 pid 文件会去关停开发者正在跑的服务。"""
+    monkeypatch.setattr(cleanup, "_reap_playwright_orphans",
+                        lambda: [(555, "chromium --user-data-dir=/x/playwright_y")])
+    assert cleanup.cleanup() == 0
+    out = capsys.readouterr().out
+    assert "顺带回收 1 个孤儿" in out
+
+
+def test_graceful_path_reaps_orphans(pid_file, monkeypatch, capsys):
+    """优雅关停成功出口回收孤儿：driver 先死于 server（OOM/-9）时，孤儿
+    Chromium 脱离 server 关闭管辖——此前该路径从不回收，孤儿永久堆积。"""
+    pid_file(pid=4321)
+    monkeypatch.setattr(cleanup, "is_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cleanup, "_http_get_json",
+                        lambda port, path, timeout=2.0:
+                        {"service": "browser_agent", "pid": 4321, "instance_id": "X"})
+    monkeypatch.setattr(cleanup, "_graceful_shutdown", lambda port, status=None: True)
+    monkeypatch.setattr(cleanup, "_wait_gone", lambda pid, timeout: True)
+    monkeypatch.setattr(cleanup, "_reap_playwright_orphans",
+                        lambda: [(777, "node /p/driver/cli.js run-driver")])
+    assert cleanup.cleanup() == 0
+    assert "顺带回收 1 个孤儿" in capsys.readouterr().out
+
+
+def test_identity_mismatch_skips_orphan_reap(pid_file, monkeypatch):
+    """端口上是别人的服务（身份不符不动它）：别人的进程树连孤儿归别人管，不扫。"""
+    pid_file(pid=4321)
+    monkeypatch.setattr(cleanup, "is_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cleanup, "_http_get_json",
+                        lambda port, path, timeout=2.0:
+                        {"service": "browser_agent", "pid": 9999})
+    reaps = []
+    monkeypatch.setattr(cleanup, "_reap_playwright_orphans",
+                        lambda: reaps.append(1) or [])
+    assert cleanup.cleanup() == 0
+    assert reaps == []
