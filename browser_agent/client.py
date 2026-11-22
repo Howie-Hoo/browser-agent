@@ -124,6 +124,10 @@ class BrowserAgentClient:
         self.auto_start = auto_start
         self.session_id = session_id or f"cli-{uuid.uuid4().hex[:8]}"
         self.owner = owner
+        # 「谁拉起谁清理」事实源：start_service 真正 Popen 出服务进程才置 True
+        # （「服务已在运行」分支不置——那是别人拉起的）。调用方据此决定退出时
+        # 是否负责清理，替代在调用侧自行探测的近似判断
+        self.started_by_me = False
         self._base = f"http://127.0.0.1:{port}"
         # 增加大超时时间，防止无尽挂起，默认为 120s，并禁用代理以防本地网络被劫持
         self._http = httpx.Client(timeout=timeout, proxy=None)
@@ -204,6 +208,7 @@ class BrowserAgentClient:
         kwargs["stderr"] = subprocess.DEVNULL
 
         subprocess.Popen(cmd, env=_server_env(), **kwargs)
+        self.started_by_me = True
 
         for i in range(60):
             time.sleep(0.5)

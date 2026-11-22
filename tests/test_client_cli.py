@@ -176,3 +176,32 @@ def test_start_service_waits_when_attach_not_connected(monkeypatch):
                         lambda: {"service": "browser_agent", "browser_mode": "managed", "browser_active": True})
     waited.clear()
     assert c.start_service() is True and waited == []
+
+
+# ── started_by_me（谁拉起谁清理的事实源）──────────────────────
+
+def test_started_by_me_defaults_false_and_stays_false_when_already_running(monkeypatch):
+    """默认 False；服务已在运行（start_service 短路分支）不置位——那是别人拉起的。"""
+    from browser_agent.client import BrowserAgentClient
+
+    c = BrowserAgentClient(auto_start=False)
+    assert c.started_by_me is False
+    monkeypatch.setattr(c, "get_status",
+                        lambda: {"service": "browser_agent", "pid": 1})
+    assert c.start_service() is True
+    assert c.started_by_me is False
+
+
+def test_started_by_me_set_only_after_popen(monkeypatch):
+    """真正 Popen 出服务进程才置 True（服务确系本进程拉起）。"""
+    import browser_agent.utils as bau
+    from browser_agent.client import BrowserAgentClient
+
+    c = BrowserAgentClient(auto_start=False)
+    monkeypatch.setattr(c, "get_status", lambda: None)
+    monkeypatch.setattr(bau, "check_system_resources", lambda: (True, ""))
+    popened = []
+    monkeypatch.setattr(ba_client.subprocess, "Popen", lambda *a, **k: popened.append(1))
+    monkeypatch.setattr(c, "is_running", lambda: True)   # 就绪轮询立即成功
+    assert c.start_service() is True
+    assert popened == [1] and c.started_by_me is True

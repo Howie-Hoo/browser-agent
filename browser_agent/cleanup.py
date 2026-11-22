@@ -18,10 +18,13 @@
 整棵树同组）→ 仍在则 SIGKILL。Windows 用 `taskkill /T` 树杀。
 幂等：无残留即空操作；清理入口始终退出 0（它只是兜底，不该成为新的失败源）。
 
-孤儿回收时机（判据见 _reap_playwright_orphans）：「无 pid 记录」「服务已死」
-「本服务刚被关停成功」三类出口都扫——机器上已无本服务，残留的孤儿化
-playwright 只能是历史遗留或本次关停漏网；「不动它」类出口（端口上是别人的
-服务）不扫，别人的进程树归别人管。
+孤儿回收时机（判据见 _reap_playwright_orphans）：所有「机器上已无本服务」的
+出口（无 pid 记录 / 记录已死 / 刚关停成功 / pid 文件损坏）统一扫——残留的
+孤儿化 playwright 只能是历史遗留或本次关停漏网；「不动它」类出口（端口上是
+别人的服务）不扫，别人的进程树归别人管。
+
+--orphans-only：兜底模式（会话收尾 hook 用）——绝不关停活服务（服务是机器级
+多会话共享单例，hook 无「谁拉起」事实），只回收孤儿 + 清已死的 pid 文件。
 
 用法：browser-agent-cleanup（pip 安装后）或 python -m browser_agent.cleanup
 """
@@ -167,6 +170,13 @@ def _reap_and_report() -> None:
             _say(f"  - {opid}: {cmd}")
 
 
+def _reap_and_drop() -> int:
+    """「机器上已无本服务」出口的统一收尾：回收孤儿 + 清 pid 文件。"""
+    _reap_and_report()
+    _drop_stale_pid_file()
+    return 0
+
+
 def _reap_playwright_orphans() -> list:
     """回收孤儿化的 playwright 子进程（服务被 SIGKILL 后残留的 Chromium/driver）。
 
@@ -205,28 +215,38 @@ def _say(msg: str) -> None:
     print(f"[清理] {msg}", flush=True)
 
 
-def cleanup() -> int:
+def cleanup(orphans_only: bool = False) -> int:
     info = _read_pid_info()
+    if orphans_only:
+        # 兜底模式：绝不关停活服务；服务状态不明时同样只动确定的孤儿
+        if info:
+            try:
+                pid = int(info["pid"])
+            except (KeyError, TypeError, ValueError):
+                pid = 0
+            if not (pid > 0 and is_pid_alive(pid)):
+                _say("无活服务记录，回收孤儿并清理 pid 文件")
+                return _reap_and_drop()
+        _say("服务在跑（或状态不明）：只回收孤儿，不动服务")
+        _reap_and_report()
+        return 0
+
     if not info:
         _say("无 pid 记录，无需清理")
-        _reap_and_report()  # 机器无本服务：孤儿只可能是历史残留
-        return 0
+        return _reap_and_drop()  # 机器无本服务：孤儿只可能是历史残留
     try:
         pid = int(info["pid"])
         port = int(info.get("port") or 0)
     except (KeyError, TypeError, ValueError):
         _say("pid 文件损坏（pid/port 不可解析）——删除后退出，不据此杀任何进程")
-        _drop_stale_pid_file()
-        return 0
+        return _reap_and_drop()
 
     if not is_pid_alive(pid):
         # 服务本体已死（SIGKILL/OOM 崩溃）：pid 文件之外，它的 playwright
         # 子进程可能成了孤儿（父链断、被 init 收养）——顺带回收，这正是
         # 清理工具存在的理由；识别不了的残留宁可留着
-        _reap_and_report()
         _say(f"pid {pid} 已退出，清理 stale pid 文件")
-        _drop_stale_pid_file()
-        return 0
+        return _reap_and_drop()
 
     if not port:
         # 我们自己写的 pid 文件必有 port；缺 port = 手改/旧版/半写坏文件。
@@ -247,10 +267,8 @@ def cleanup() -> int:
         if _wait_gone(pid, _GRACEFUL_WAIT_SEC):
             _say("已退出 ✓")
             # 优雅路径无进程组信号兜底：driver 先死于 server（OOM/-9）时，
-            # 孤儿 Chromium 脱离 server 关闭管辖，主动扫一遍
-            _reap_and_report()
-            _drop_stale_pid_file()
-            return 0
+            # 孤儿 Chromium 脱离 server 关闭管辖，收尾统一扫
+            return _reap_and_drop()
         _say("优雅关停未在期限内完成，升级为进程树终止")
     else:
         _say("服务无响应，直接进程树终止")
@@ -258,18 +276,15 @@ def cleanup() -> int:
     _terminate_tree(pid)
     if _wait_gone(pid, _TERM_WAIT_SEC):
         _say("已退出 ✓")
-        _reap_and_report()
-        _drop_stale_pid_file()
-        return 0
+        return _reap_and_drop()
     _terminate_tree(pid, force=True)
     _say("已强制终止（SIGKILL / taskkill /F）")
-    _reap_and_report()
-    _drop_stale_pid_file()
-    return 0
+    return _reap_and_drop()
 
 
-def main() -> int:
-    return cleanup()
+def main(argv: list | None = None) -> int:
+    args = sys.argv[1:] if argv is None else list(argv)
+    return cleanup(orphans_only="--orphans-only" in args)
 
 
 if __name__ == "__main__":

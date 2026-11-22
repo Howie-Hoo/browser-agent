@@ -222,3 +222,47 @@ def test_identity_mismatch_skips_orphan_reap(pid_file, monkeypatch):
                         lambda: reaps.append(1) or [])
     assert cleanup.cleanup() == 0
     assert reaps == []
+
+
+# ── --orphans-only 兜底模式（会话收尾 hook 用：绝不关停活服务）────
+
+def test_orphans_only_leaves_live_service_alone(pid_file, monkeypatch, capsys):
+    """服务在跑：只回收孤儿，绝不发关停/终止信号、不动 pid 文件。"""
+    path = pid_file(pid=4321)
+    monkeypatch.setattr(cleanup, "is_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cleanup, "_http_get_json",
+                        lambda port, path, timeout=2.0:
+                        {"service": "browser_agent", "pid": 4321, "instance_id": "X"})
+    acted = []
+    monkeypatch.setattr(cleanup, "_graceful_shutdown",
+                        lambda *a, **k: acted.append("graceful") or True)
+    monkeypatch.setattr(cleanup, "_terminate_tree",
+                        lambda pid, force=False: acted.append(("term", force)))
+    monkeypatch.setattr(cleanup, "_reap_playwright_orphans",
+                        lambda: [(900, "chromium --user-data-dir=/x/playwright_z")])
+    assert cleanup.cleanup(orphans_only=True) == 0
+    assert acted == []                      # 活服务分毫未动
+    assert path.exists()                    # pid 文件保留
+    out = capsys.readouterr().out
+    assert "只回收孤儿" in out and "顺带回收 1 个孤儿" in out
+
+
+def test_orphans_only_dead_pid_reaps_and_drops(pid_file, monkeypatch):
+    """服务已死：回收孤儿 + 清 pid 文件（无主残留全收）。"""
+    path = pid_file(pid=4321)
+    monkeypatch.setattr(cleanup, "is_pid_alive", lambda pid: False)
+    reaped = []
+    monkeypatch.setattr(cleanup, "_reap_playwright_orphans",
+                        lambda: reaped.append(1) or [(900, "chromium")])
+    assert cleanup.cleanup(orphans_only=True) == 0
+    assert not path.exists() and reaped == [1]
+
+
+def test_orphans_only_no_pid_file_reaps(isolated_home, monkeypatch, capsys):
+    """无 pid 记录：只回收孤儿（历史残留）。"""
+    reaped = []
+    monkeypatch.setattr(cleanup, "_reap_playwright_orphans",
+                        lambda: reaped.append(1) or [])
+    assert cleanup.cleanup(orphans_only=True) == 0
+    assert reaped == [1]
+    assert "只回收孤儿" in capsys.readouterr().out
