@@ -1,5 +1,5 @@
 """browser-agent：给 AI 代理用的本地浏览器操作微服务（Playwright）。"""
-__version__ = "2026.11.21.1"
+__version__ = "2026.11.22"
 
 # 服务身份名：server 写进 /status 与 pid 文件，client/cleanup 据此核对——
 # 三方共用一个声明，改名不会出现某方核对恒失败的漂移
