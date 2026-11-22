@@ -118,8 +118,9 @@ _PARSE_CACHE: dict = {}
 def _load_all() -> list:
     """全量解析（带缓存）。/status 每次操作前被轮询、navigate 每步带经验提示、
     read_site 频繁调用——无缓存时是 O(文件数) 的读盘+YAML 解析，且为事件循环上的
-    同步 IO。以目录 mtime 为键：写入/删除/手改都会改变目录 mtime → 自动失效，
-    每次调用只付一次 stat 的代价。"""
+    同步 IO。失效双保险：模块内 write_pattern/delete_pattern 成功后主动清缓存；
+    mtime 键兜底外部手改（mtime 有时钟粒度，同窗口连续变更可能不更新——
+    不能只靠它）。"""
     root = site_patterns_dir()
     try:
         mtime = os.stat(root).st_mtime_ns
@@ -314,6 +315,9 @@ def write_pattern(domain: str, aliases: Optional[list] = None,
         raise
     if appended:
         log(f"站点经验已更新: {domain}（+{appended} 条）")
+    # 写路径主动失效缓存：mtime 键在时钟粒度窗口内不更新（tmpfs 实测同一
+    # 窗口内写+删 mtime 不变概率 >95%），靠 mtime 判失效会伪命中旧缓存
+    _PARSE_CACHE.clear()
     return {"ok": True, "domain": domain, "path": path,
             "appended_entries": appended, "aliases": merged_aliases}
 
@@ -326,6 +330,7 @@ def delete_pattern(domain: str) -> dict:
     if not os.path.isfile(path):
         return {"ok": False, "error": f"域名 '{domain}' 无经验文件"}
     os.remove(path)
+    _PARSE_CACHE.clear()
     return {"ok": True, "domain": domain}
 
 

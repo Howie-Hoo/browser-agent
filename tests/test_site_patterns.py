@@ -6,6 +6,7 @@
 import os
 import sys
 from datetime import date
+from stat import S_ISDIR
 
 import pytest
 
@@ -201,3 +202,29 @@ def test_free_text_domain_match_requires_boundary(store):
     sp.write_pattern("a.co", patterns=["p"])
     assert sp.match_site("看看 xa.co.cn 的新功能")["matched"] is False
     assert sp.match_site("去 a.co 看看")["matched"] is True
+
+
+def test_write_delete_invalidate_cache_within_mtime_window(store, monkeypatch):
+    """缓存失效不依赖 mtime：tmpfs 时钟粒度窗口内写+删 mtime 可不变（实测 >95%），
+    write/delete 后必须立即可见——目录 stat 冻结为固定 mtime 模拟该窗口。"""
+    real_stat = os.stat
+
+    def _frozen(p, **k):
+        st = real_stat(p, **k)
+        # 判目录不得走 os.path.isdir（内部调 os.stat → 递归回本替身）
+        if not S_ISDIR(st.st_mode):
+            return st
+        # 真 stat_result 类型（10 元组构造），目录 mtime 冻结为常量
+        return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink,
+                               st.st_uid, st.st_gid, st.st_size,
+                               st.st_atime, 1700000000.0, st.st_ctime))
+
+    monkeypatch.setattr(os, "stat", _frozen)
+    sp.write_pattern("a.com", patterns=["p1"])
+    sp.write_pattern("b.com", patterns=["p2"])
+    assert sp.list_patterns()["count"] == 2
+    assert sp.delete_pattern("a.com")["ok"] is True
+    assert sp.list_patterns()["count"] == 1
+    sp.write_pattern("c.com", patterns=["p3"])
+    assert sp.list_patterns()["count"] == 2
+    assert sp.match_site("https://c.com/")["matched"] is True
